@@ -1,0 +1,24 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fixture } from './public-fixture.mjs';
+
+const root = fileURLToPath(new URL('../', import.meta.url));
+const report = JSON.parse(execFileSync(process.execPath, ['scripts/package.mjs'], { cwd: root, encoding: 'utf8' }));
+assert(report.ok);
+assert.deepEqual(fs.readdirSync(report.dist).sort(), ['README-DEPLOY.md', 'worker.js', 'wrangler.toml']);
+const source = fs.readFileSync(path.join(report.dist, 'worker.js'), 'utf8');
+assert.doesNotMatch(source, /^\s*import\s/m);
+assert.equal((source.match(/^export\s/gm) || []).length, 1);
+assert.match(source, /查看公告/);
+assert.match(fs.readFileSync(path.join(report.dist, 'wrangler.toml'), 'utf8'), /main = "worker.js"/);
+const { default: worker } = await import(pathToFileURL(path.join(report.dist, 'worker.js')).href);
+const response = await worker.fetch(new Request('https://mirror.test/?tag=1.9.6'), fixture().env);
+assert.equal(response.status, 200);
+assert.match(await response.text(), /公告 · 1\.9\.6/);
+const bytes = fs.readFileSync(report.zip);
+assert.equal(bytes.readUInt32LE(0), 0x04034b50);
+assert(bytes.length > 1000);
+console.log('Packaged Worker serves public announcements without source imports; ZIP and configuration checks passed.');

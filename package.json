@@ -1,0 +1,23 @@
+{
+  "name": "rp-hub-update-mirror",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "RP-Hub update mirror with public version announcements",
+  "license": "CC-BY-NC-4.0",
+  "engines": {
+    "node": ">=22.22.2"
+  },
+  "scripts": {
+    "test": "node scripts/prepare-test-fixtures.mjs && node tests/mirror-worker.test.mjs && node tests/public-announcements.test.mjs",
+    "test:browser": "node tests/public-announcements.browser.mjs",
+    "test:package": "node tests/package.test.mjs",
+    "build": "node scripts/package.mjs",
+    "dev": "wrangler dev --local",
+    "deploy:check": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1",
+    "wrangler": "4.110.0"
+  }
+}

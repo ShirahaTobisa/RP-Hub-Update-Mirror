@@ -1,0 +1,2 @@
+# Preserve source bytes: release tests and asset URLs depend on SHA-256.
+* -text

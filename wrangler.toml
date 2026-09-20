@@ -1,0 +1,20 @@
+
+name = "rp-hub-update-mirror"
+main = "worker.mjs"
+compatibility_date = "2026-08-12"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+UPSTREAM_REPO = "STA1N156/RP-Hub"
+RELEASE_LIMIT = "12"
+
+[observability]
+enabled = true
+
+[[r2_buckets]]
+binding = "MIRROR_BUCKET"
+bucket_name = "rp-hub-update-mirror"
+
+[triggers]
+crons = ["7,37 * * * *"]
+
