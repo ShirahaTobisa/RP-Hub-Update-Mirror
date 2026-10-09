@@ -4,8 +4,8 @@ import { fileURLToPath } from 'node:url';
 
 const directory = fileURLToPath(new URL('../.cache/upstream', import.meta.url));
 const commits = [
-    '1ede9a99fbf4db8c0069515a87a45d915616faf8',
-    '8911f4bba41cfe3b1a092862697b99faf7716d7d',
+    '53a8d80951e594e717b8081873b2f77eb809d0fc',
+    'ed372012fde428499d024ac3623902b754af7721',
     '936b47f6e992d77d61e20b93ef24360964372e9a'
 ];
 fs.mkdirSync(directory, { recursive: true });
