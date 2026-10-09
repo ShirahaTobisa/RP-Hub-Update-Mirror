@@ -816,7 +816,7 @@ function authRouteCase(pathname) {
 }
 
 async function testWriteAuthenticationMatrix() {
-    const routes = ['/api/sync', '/api/pending/retry', '/api/versions/delete', '/api/webhook-test', '/api/config'];
+    const routes = ['/api/sync', '/api/sync/test-releases', '/api/pending/retry', '/api/versions/delete', '/api/webhook-test', '/api/config'];
     for (const pathname of routes) {
         {
             const { bucket, fixture, request } = authRouteCase(pathname);
@@ -986,6 +986,7 @@ async function testManualSyncUsesPublisherSyncPath() {
     const result = await response.json();
     assert.equal(result.ok, true);
     assert.deepEqual(result.events, ['version_published']);
+    assert.equal(result.testReleases, undefined, 'upstream sync must not also sync test releases');
     assert.equal(bucket.json('manifest.json').versions[0].commit, PASS_COMMIT_NEW);
     assert(fixture.calls.some((url) => url.includes('/releases?per_page=12')));
     assert(fixture.calls.some((url) => url.includes(`/git/trees/${PASS_COMMIT_NEW}`)));

@@ -100,3 +100,27 @@ manifest = JSON.parse(await (await env.MIRROR_BUCKET.get('test-releases/manifest
 assert.equal(manifest.versions[0].bundle.assetId, 51);
 assert.equal(github.downloads.size, 2);
 console.log('PASS re-published release assets are downloaded again');
+
+// 管理端「同步测试版」：只拉测试版，不碰上游版本；没有管理令牌时拒绝。
+const adminEnv = { ...env, ADMIN_TOKEN: 'fixture-admin-token' };
+const syncTestsRequest = (token) => new Request('https://mirror.test/api/sync/test-releases', {
+    method: 'POST', headers: token ? { authorization: `Bearer ${token}` } : {}
+});
+const requested = [];
+const third = release('2026.10.10', 6);
+github = fakeGitHub([third.entry, replaced.entry], new Map([...replaced.files, ...third.files]));
+const previousFetch = globalThis.fetch;
+globalThis.fetch = async (url, init) => { requested.push(String(url)); return github.fetchImpl(url, init); };
+try {
+    assert.notEqual((await mirrorWorker.fetch(syncTestsRequest(null), adminEnv)).status, 200);
+    assert.equal(requested.length, 0, 'unauthorized sync must not reach GitHub');
+    const response = await mirrorWorker.fetch(syncTestsRequest('fixture-admin-token'), adminEnv);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.versionCount, 2);
+    assert.ok(requested.every((url) => url.includes(REPO) || url.startsWith('https://api.github.com/assets/')), requested.join('\n'));
+} finally {
+    globalThis.fetch = previousFetch;
+}
+console.log('PASS admin test-release sync pulls only test releases and requires the admin token');
