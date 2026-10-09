@@ -1597,7 +1597,8 @@ async function listWorkshopPending(bucket) {
         const value = (await readJsonObject(bucket, object.key)).value;
         if (plainObject(value)) entries.push(value);
     }
-    return entries.sort((left, right) => Number(left.submittedAt || 0) - Number(right.submittedAt || 0));
+    return entries.sort((left, right) => Number(left.submittedAt || 0) - Number(right.submittedAt || 0)
+        || String(left.id).localeCompare(String(right.id)));
 }
 
 async function readWorkshopIndexState(bucket) {
