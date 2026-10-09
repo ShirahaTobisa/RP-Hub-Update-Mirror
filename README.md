@@ -27,7 +27,7 @@ npm run test:package
 npm run build
 ```
 
-测试准备脚本会下载三个固定的上游 Git commit 到 `.cache/upstream/`；不依赖 RP-Hub 主站目录。测试使用模拟 R2 和数据，不需要生产密钥。浏览器测试覆盖桌面、手机视口及禁用 JavaScript 的访问。
+测试准备脚本把上游提交下载到 `.cache/upstream/`：“通过”锚点取线上分发端已收录的最新两个正式版本，自动跟随上游，不用手工更新（分发端连不上时沿用上次的锚点，可用 `MIRROR_BASE` 改地址）；“拒绝”锚点是固定的历史提交。不依赖 RP-Hub 主站目录。测试使用模拟 R2 和数据，不需要生产密钥。浏览器测试覆盖桌面、手机视口及禁用 JavaScript 的访问。
 
 `worker.mjs` 是分发端入口，`lib/app-patches.mjs` 是上游页面兼容性检查依赖。来源和维护方式见 [ORIGIN.md](ORIGIN.md)。
 

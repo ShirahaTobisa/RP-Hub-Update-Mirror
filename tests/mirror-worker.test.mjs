@@ -1,6 +1,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { bytesOf, FakeR2 } from './r2.mjs';
 import { webcrypto } from 'node:crypto';
 import { deflateRawSync } from 'node:zlib';
@@ -14,9 +15,13 @@ if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const UPSTREAM_REPO_DIR = path.resolve(TEST_DIR, '..', '.cache', 'upstream');
-const PASS_COMMIT_OLD = '53a8d80951e594e717b8081873b2f77eb809d0fc';
-const PASS_COMMIT_NEW = 'ed372012fde428499d024ac3623902b754af7721';
-const REJECT_COMMIT = '936b47f6e992d77d61e20b93ef24360964372e9a';
+// 锚点由 scripts/prepare-test-fixtures.mjs 从线上分发端自动选出：最新两个已收录的正式版本，加一个固定的“应被拒绝”提交。
+const ANCHORS = JSON.parse(readFileSync(path.join(UPSTREAM_REPO_DIR, 'anchors.json'), 'utf8'));
+const PASS_COMMIT_OLD = ANCHORS.old.commit;
+const PASS_COMMIT_NEW = ANCHORS.new.commit;
+const OLD_TAG = ANCHORS.old.tag;
+const NEW_TAG = ANCHORS.new.tag;
+const REJECT_COMMIT = ANCHORS.reject;
 const FIXED_NOW = 1786464000000;
 
 function gitTree(commit) {
@@ -283,7 +288,7 @@ async function runSync(bucket, state) {
 async function testNewVersionAndWebhookFailure() {
     const bucket = new FakeR2();
     const state = {
-        releases: [release('2.0.0', PASS_COMMIT_NEW, 'RP-Hub 2.0.0')],
+        releases: [release(NEW_TAG, PASS_COMMIT_NEW, `RP-Hub ${NEW_TAG}`)],
         webhookStatus: 503
     };
     const { result, fixture } = await runSync(bucket, state);
@@ -309,31 +314,31 @@ async function testNewVersionAndWebhookFailure() {
     assert.equal(manifest.versions[0].precheckPatchRevision, RP_HUB_APP_PATCH_REVISION);
     assert.deepEqual(Object.keys(manifest.versions[0].files[0]), ['path', 'sha256', 'size']);
     assert(manifest.versions[0].files.every((file) => /^[a-f0-9]{64}$/.test(file.sha256)));
-    assert(bucket.keys(`snapshots/2.0.0/${PASS_COMMIT_NEW}/`).length > 0);
+    assert(bucket.keys(`snapshots/${NEW_TAG}/${PASS_COMMIT_NEW}/`).length > 0);
     assert(bucket.putCalls.some((call) => call.key === 'manifest.json' && call.onlyIf?.etagDoesNotMatch === '*'));
 }
 
 async function testRetagPassSwitchesCommit() {
     const bucket = new FakeR2();
-    await runSync(bucket, { releases: [release('2.0.0', PASS_COMMIT_OLD)] });
-    const oldSnapshotKeys = bucket.keys(`snapshots/2.0.0/${PASS_COMMIT_OLD}/`);
+    await runSync(bucket, { releases: [release(NEW_TAG, PASS_COMMIT_OLD)] });
+    const oldSnapshotKeys = bucket.keys(`snapshots/${NEW_TAG}/${PASS_COMMIT_OLD}/`);
     assert(oldSnapshotKeys.length > 0);
 
-    const { result, fixture } = await runSync(bucket, { releases: [release('2.0.0', PASS_COMMIT_NEW)] });
+    const { result, fixture } = await runSync(bucket, { releases: [release(NEW_TAG, PASS_COMMIT_NEW)] });
     assert.equal(result.ok, true);
     assert.deepEqual(result.events, ['retag_republished']);
     assert.equal(bucket.json('manifest.json').versions[0].commit, PASS_COMMIT_NEW);
-    assert.deepEqual(bucket.keys(`snapshots/2.0.0/${PASS_COMMIT_OLD}/`), oldSnapshotKeys,
+    assert.deepEqual(bucket.keys(`snapshots/${NEW_TAG}/${PASS_COMMIT_OLD}/`), oldSnapshotKeys,
         'retag removed the old immutable snapshot');
-    assert(bucket.keys(`snapshots/2.0.0/${PASS_COMMIT_NEW}/`).length > 0);
+    assert(bucket.keys(`snapshots/${NEW_TAG}/${PASS_COMMIT_NEW}/`).length > 0);
     assert.equal(fixture.webhooks.at(-1).payload.event, 'retag_republished');
 }
 
 async function testRetagRejectKeepsOldCommit() {
     const bucket = new FakeR2();
-    await runSync(bucket, { releases: [release('2.0.0', PASS_COMMIT_NEW)] });
+    await runSync(bucket, { releases: [release(NEW_TAG, PASS_COMMIT_NEW)] });
 
-    const { result, fixture } = await runSync(bucket, { releases: [release('2.0.0', REJECT_COMMIT)] });
+    const { result, fixture } = await runSync(bucket, { releases: [release(NEW_TAG, REJECT_COMMIT)] });
     assert.equal(result.ok, true);
     assert.deepEqual(result.events, ['retag_precheck_failed']);
     const manifest = bucket.json('manifest.json');
@@ -341,10 +346,10 @@ async function testRetagRejectKeepsOldCommit() {
     assert.equal(manifest.pending.length, 1);
     assert.deepEqual(
         { tag: manifest.pending[0].tag, commit: manifest.pending[0].commit, reason: manifest.pending[0].reason },
-        { tag: '2.0.0', commit: REJECT_COMMIT, reason: 'patch-rejected' }
+        { tag: NEW_TAG, commit: REJECT_COMMIT, reason: 'patch-rejected' }
     );
     assert.equal(
-        bucket.keys(`snapshots/2.0.0/${REJECT_COMMIT}/`).length,
+        bucket.keys(`snapshots/${NEW_TAG}/${REJECT_COMMIT}/`).length,
         gitTree(REJECT_COMMIT).length,
         'rejected retag did not retain its complete raw snapshot'
     );
@@ -377,19 +382,19 @@ async function testArtifactDirectIntakeStoredAndDeflated() {
             created_at: '2026-08-13T14:44:42Z'
         });
         const fixture = createFixtureFetch({
-            releases: [release('2.0.0', PASS_COMMIT_OLD)],
+            releases: [release(NEW_TAG, PASS_COMMIT_OLD)],
             artifacts: [artifact]
         });
         const result = await syncMirror(env(bucket), { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW });
         assert.equal(result.ok, true);
         const manifest = bucket.json('manifest.json');
         assert.equal(manifest.versions.length, 2);
-        assert.equal(manifest.versions[0].tag, '2.0.0-0813');
+        assert.equal(manifest.versions[0].tag, `${NEW_TAG}-0813`);
         assert.equal(manifest.versions[0].commit, PASS_COMMIT_NEW);
-        assert.equal(bucket.keys(`snapshots/2.0.0-0813/${PASS_COMMIT_NEW}/`).length > 0, true);
+        assert.equal(bucket.keys(`snapshots/${NEW_TAG}-0813/${PASS_COMMIT_NEW}/`).length > 0, true);
         assert(fixture.calls.some((url) => url.endsWith('/actions/artifacts/fixture/zip')));
-        for (const key of bucket.keys(`snapshots/2.0.0-0813/${PASS_COMMIT_NEW}/`)) {
-            const pathInSnapshot = key.slice(`snapshots/2.0.0-0813/${PASS_COMMIT_NEW}/`.length);
+        for (const key of bucket.keys(`snapshots/${NEW_TAG}-0813/${PASS_COMMIT_NEW}/`)) {
+            const pathInSnapshot = key.slice(`snapshots/${NEW_TAG}-0813/${PASS_COMMIT_NEW}/`.length);
             assert.deepEqual(
                 new Uint8Array(bucket.records.get(key).bytes),
                 new Uint8Array(gitBlob(PASS_COMMIT_NEW, pathInSnapshot)),
@@ -421,12 +426,12 @@ async function testArtifactReleaseCommitUsesOfficialTreePipeline() {
     const bucket = new FakeR2();
     const artifact = await artifactSpec(PASS_COMMIT_NEW, 0);
     const fixture = createFixtureFetch({
-        releases: [release('2.0.0', PASS_COMMIT_NEW)],
+        releases: [release(NEW_TAG, PASS_COMMIT_NEW)],
         artifacts: [artifact]
     });
     const result = await syncMirror(env(bucket), { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW });
     assert.equal(result.ok, true);
-    assert.equal(bucket.json('manifest.json').versions[0].tag, '2.0.0');
+    assert.equal(bucket.json('manifest.json').versions[0].tag, NEW_TAG);
     assert(fixture.calls.some((url) => url.includes(`/git/trees/${PASS_COMMIT_NEW}`)));
     assert.equal(fixture.calls.some((url) => url.endsWith('/actions/artifacts/fixture/zip')), false);
 }
@@ -434,7 +439,7 @@ async function testArtifactReleaseCommitUsesOfficialTreePipeline() {
 async function testArtifactListFailureDoesNotBlockOfficialPipeline() {
     const bucket = new FakeR2();
     const fixture = createFixtureFetch({
-        releases: [release('2.0.0', PASS_COMMIT_NEW)],
+        releases: [release(NEW_TAG, PASS_COMMIT_NEW)],
         failArtifacts: true
     });
     const result = await syncMirror(env(bucket), { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW });
@@ -545,14 +550,14 @@ async function testArtifactOnReleaseCommitSweepsStaleDerived() {
 
     const releaseArtifact = await artifactSpec(PASS_COMMIT_NEW, 0);
     const fixture = createFixtureFetch({
-        releases: [release('2.0.0', PASS_COMMIT_NEW)],
+        releases: [release(NEW_TAG, PASS_COMMIT_NEW)],
         artifacts: [releaseArtifact]
     });
     const result = await syncMirror(env(bucket), { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW + 1000 });
     assert.equal(result.ok, true);
     assert.deepEqual(
         bucket.json('manifest.json').versions.map((version) => version.tag),
-        ['2.0.0'],
+        [NEW_TAG],
         'stale derived preview (different commit) survived a release-commit artifact round'
     );
 }
@@ -565,22 +570,22 @@ async function testStaleDerivedDemotedWhenArtifactCheckUnavailable() {
         now: () => FIXED_NOW
     });
     const fixture = createFixtureFetch({
-        releases: [release('2.0.0', PASS_COMMIT_NEW)],
+        releases: [release(NEW_TAG, PASS_COMMIT_NEW)],
         failArtifacts: true
     });
     const result = await syncMirror(env(bucket), { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW + 1000 });
     assert.equal(result.ok, true);
     assert.deepEqual(
         bucket.json('manifest.json').versions.map((version) => version.tag),
-        ['2.0.0', '0.0.0-0813'],
+        [NEW_TAG, '0.0.0-0813'],
         'older derived preview must not outrank a newer release at versions[0]'
     );
 }
 
 async function testManualVersionDelete() {
     const bucket = new FakeR2();
-    await runSync(bucket, { releases: [release('2.0.0', PASS_COMMIT_NEW)] });
-    const snapshotKeys = bucket.keys(`snapshots/2.0.0/${PASS_COMMIT_NEW}/`);
+    await runSync(bucket, { releases: [release(NEW_TAG, PASS_COMMIT_NEW)] });
+    const snapshotKeys = bucket.keys(`snapshots/${NEW_TAG}/${PASS_COMMIT_NEW}/`);
     assert(snapshotKeys.length > 0);
 
     const badRequest = await workerFetch(
@@ -604,18 +609,18 @@ async function testManualVersionDelete() {
     const response = await workerFetch(
         adminRequest('/api/versions/delete', {
             method: 'POST',
-            body: JSON.stringify({ tag: '2.0.0', commit: PASS_COMMIT_NEW })
+            body: JSON.stringify({ tag: NEW_TAG, commit: PASS_COMMIT_NEW })
         }),
         adminEnv(bucket)
     );
     assert.equal(response.status, 200);
     const result = await response.json();
     assert.equal(result.ok, true);
-    assert.deepEqual(result.deleted, { tag: '2.0.0', commit: PASS_COMMIT_NEW });
+    assert.deepEqual(result.deleted, { tag: NEW_TAG, commit: PASS_COMMIT_NEW });
     assert.equal(result.snapshotsDeleted, snapshotKeys.length);
     const manifest = bucket.json('manifest.json');
     assert.deepEqual(manifest.versions, []);
-    assert.deepEqual(bucket.keys(`snapshots/2.0.0/${PASS_COMMIT_NEW}/`), [],
+    assert.deepEqual(bucket.keys(`snapshots/${NEW_TAG}/${PASS_COMMIT_NEW}/`), [],
         'manual delete must reclaim the version snapshot objects');
     assert(bucket.putCalls.some((call) => call.key === 'manifest.json' && call.onlyIf?.etagMatches !== undefined),
         'manual delete must commit the manifest with a CAS put');
@@ -630,14 +635,14 @@ async function testArtifactReleaseCommitPromotesDerivedVersion() {
     });
     assert.equal(bucket.json('manifest.json').versions[0].tag, '0.0.0-0813');
     const fixture = createFixtureFetch({
-        releases: [release('2.0.0', PASS_COMMIT_NEW)],
+        releases: [release(NEW_TAG, PASS_COMMIT_NEW)],
         artifacts: [artifact]
     });
     const result = await syncMirror(env(bucket), { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW });
     assert.equal(result.ok, true);
     const manifest = bucket.json('manifest.json');
     assert.equal(manifest.versions.length, 1);
-    assert.equal(manifest.versions[0].tag, '2.0.0');
+    assert.equal(manifest.versions[0].tag, NEW_TAG);
     assert.equal(manifest.versions[0].commit, PASS_COMMIT_NEW);
     assert.equal(manifest.versions.some((version) => version.tag === '0.0.0-0813'), false);
 }
@@ -677,7 +682,7 @@ async function testExpiredArtifactFallsBackToTree() {
 async function testSnapshotBudgetSpreadsBuildsAcrossRounds() {
     const bucket = new FakeR2();
     const state = {
-        releases: [release('2.0.0', PASS_COMMIT_NEW), release('1.9.8', PASS_COMMIT_OLD)]
+        releases: [release(NEW_TAG, PASS_COMMIT_NEW), release(OLD_TAG, PASS_COMMIT_OLD)]
     };
     const fixture = createFixtureFetch(state);
     const options = { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW };
@@ -690,17 +695,17 @@ async function testSnapshotBudgetSpreadsBuildsAcrossRounds() {
     assert.match(progressAfterFirst.phase, /待回填/);
     const firstManifest = bucket.json('manifest.json');
     assert.equal(firstManifest.versions.length, 1);
-    assert.equal(firstManifest.versions[0].tag, '2.0.0');
+    assert.equal(firstManifest.versions[0].tag, NEW_TAG);
     assert.deepEqual(firstManifest.pending, [], 'deferred release must not be marked pending');
-    assert.equal(bucket.keys(`snapshots/1.9.8/${PASS_COMMIT_OLD}/`).length, 0);
+    assert.equal(bucket.keys(`snapshots/${OLD_TAG}/${PASS_COMMIT_OLD}/`).length, 0);
 
     const second = await syncMirror(env(bucket), options);
     assert.equal(second.ok, true);
     assert.deepEqual(second.snapshotBudget, { used: 1, limit: 1, deferred: false });
     const secondManifest = bucket.json('manifest.json');
     assert.equal(secondManifest.versions.length, 2);
-    assert.deepEqual(secondManifest.versions.map((version) => version.tag), ['2.0.0', '1.9.8']);
-    assert(bucket.keys(`snapshots/1.9.8/${PASS_COMMIT_OLD}/`).length > 0);
+    assert.deepEqual(secondManifest.versions.map((version) => version.tag), [NEW_TAG, OLD_TAG]);
+    assert(bucket.keys(`snapshots/${OLD_TAG}/${PASS_COMMIT_OLD}/`).length > 0);
 
     const third = await syncMirror(env(bucket), options);
     assert.equal(third.ok, true);
@@ -712,7 +717,7 @@ async function testSnapshotBudgetDefersTreeFallbackNotZipIntake() {
     const bucket = new FakeR2();
     const expiredArtifact = await artifactSpec(PASS_COMMIT_NEW, 0, { expired: true });
     const treeState = {
-        releases: [release('1.9.8', PASS_COMMIT_OLD)],
+        releases: [release(OLD_TAG, PASS_COMMIT_OLD)],
         artifacts: [expiredArtifact]
     };
     const treeFixture = createFixtureFetch(treeState);
@@ -721,23 +726,23 @@ async function testSnapshotBudgetDefersTreeFallbackNotZipIntake() {
     assert.equal(first.ok, true);
     assert.deepEqual(first.snapshotBudget, { used: 1, limit: 1, deferred: true });
     const firstManifest = bucket.json('manifest.json');
-    assert.deepEqual(firstManifest.versions.map((version) => version.tag), ['1.9.8'],
+    assert.deepEqual(firstManifest.versions.map((version) => version.tag), [OLD_TAG],
         'release build must win the round budget over the derived tree fallback');
     const second = await syncMirror(env(bucket), options);
     assert.equal(second.ok, true);
     assert.deepEqual(second.snapshotBudget, { used: 1, limit: 1, deferred: false });
-    assert.deepEqual(bucket.json('manifest.json').versions.map((version) => version.tag), ['1.9.8-0813', '1.9.8']);
+    assert.deepEqual(bucket.json('manifest.json').versions.map((version) => version.tag), [`${OLD_TAG}-0813`, OLD_TAG]);
 
     const zipBucket = new FakeR2();
     const zipState = {
-        releases: [release('1.9.8', PASS_COMMIT_OLD)],
+        releases: [release(OLD_TAG, PASS_COMMIT_OLD)],
         artifacts: [await artifactSpec(PASS_COMMIT_NEW, 0)]
     };
     const zipFixture = createFixtureFetch(zipState);
     const zipResult = await syncMirror(env(zipBucket), { fetchImpl: zipFixture.fetchImpl, now: () => FIXED_NOW });
     assert.equal(zipResult.ok, true);
     assert.deepEqual(zipResult.snapshotBudget, { used: 1, limit: 1, deferred: false });
-    assert.deepEqual(zipBucket.json('manifest.json').versions.map((version) => version.tag), ['1.9.8-0813', '1.9.8'],
+    assert.deepEqual(zipBucket.json('manifest.json').versions.map((version) => version.tag), [`${OLD_TAG}-0813`, OLD_TAG],
         'zip intake is not tree-metered and must land in the same round as one release build');
 }
 
@@ -759,7 +764,7 @@ async function testSyncErrorWebhookIsDeduplicated() {
 
 function authRouteCase(pathname) {
     const bucket = new FakeR2();
-    const fixture = createFixtureFetch({ releases: [release('2.0.0', PASS_COMMIT_NEW)] });
+    const fixture = createFixtureFetch({ releases: [release(NEW_TAG, PASS_COMMIT_NEW)] });
     if (pathname === '/api/pending/retry') {
         bucket.seedJson('manifest.json', {
             schema: 1,
@@ -767,7 +772,7 @@ function authRouteCase(pathname) {
             upstreamRepo: 'STA1N156/RP-Hub',
             versions: [],
             pending: [{
-                tag: '2.0.0',
+                tag: NEW_TAG,
                 commit: PASS_COMMIT_NEW,
                 reason: 'release-incomplete',
                 detail: 'fixture pending',
@@ -781,9 +786,9 @@ function authRouteCase(pathname) {
             updatedAt: FIXED_NOW,
             upstreamRepo: 'STA1N156/RP-Hub',
             versions: [{
-                tag: '2.0.0',
+                tag: NEW_TAG,
                 commit: PASS_COMMIT_NEW,
-                name: '2.0.0',
+                name: NEW_TAG,
                 date: '2026-08-12T00:00:00Z',
                 precheckPatchRevision: RP_HUB_APP_PATCH_REVISION,
                 publishedAt: FIXED_NOW,
@@ -802,7 +807,7 @@ function authRouteCase(pathname) {
         if (pathname === '/api/pending/retry' || pathname === '/api/versions/delete') {
             return adminRequest(pathname, {
                 method: 'POST',
-                body: JSON.stringify({ tag: '2.0.0', commit: PASS_COMMIT_NEW })
+                body: JSON.stringify({ tag: NEW_TAG, commit: PASS_COMMIT_NEW })
             }, token);
         }
         return adminRequest(pathname, { method: 'POST' }, token);
@@ -966,7 +971,7 @@ async function testPublicMirrorRoutes() {
 
 async function testManualSyncUsesPublisherSyncPath() {
     const bucket = new FakeR2();
-    const fixture = createFixtureFetch({ releases: [release('2.0.0', PASS_COMMIT_NEW)] });
+    const fixture = createFixtureFetch({ releases: [release(NEW_TAG, PASS_COMMIT_NEW)] });
     const response = await workerFetch(
         adminRequest('/api/sync', { method: 'POST' }),
         adminEnv(bucket),
@@ -1071,7 +1076,7 @@ async function testRuntimeConfigClampFailSoftAndWebhookDisable() {
 
     const disabledBucket = new FakeR2();
     disabledBucket.seedJson('_mirror/config.json', { releaseLimit: 12, webhookEnabled: false });
-    const disabledFixture = createFixtureFetch({ releases: [release('2.0.0', PASS_COMMIT_NEW)] });
+    const disabledFixture = createFixtureFetch({ releases: [release(NEW_TAG, PASS_COMMIT_NEW)] });
     const disabledResult = await syncMirror(env(disabledBucket), {
         fetchImpl: disabledFixture.fetchImpl,
         now: () => FIXED_NOW
@@ -1148,7 +1153,7 @@ function realShapeAnnouncementFixture() {
 
 async function testAnnouncementExtractedForPublishedVersion() {
     const bucket = new FakeR2();
-    const { result } = await runSync(bucket, { releases: [release('2.0.0', PASS_COMMIT_NEW, 'RP-Hub 2.0.0')] });
+    const { result } = await runSync(bucket, { releases: [release(NEW_TAG, PASS_COMMIT_NEW, `RP-Hub ${NEW_TAG}`)] });
     assert.equal(result.ok, true);
     assert.deepEqual(
         Object.keys(result).sort(),
@@ -1160,14 +1165,16 @@ async function testAnnouncementExtractedForPublishedVersion() {
     assert.equal(announcements.generatedAt, FIXED_NOW);
     assert.equal(announcements.entries.length, 1);
     const entry = announcements.entries[0];
-    assert.deepEqual({ tag: entry.tag, commit: entry.commit }, { tag: '2.0.0', commit: PASS_COMMIT_NEW });
+    assert.deepEqual({ tag: entry.tag, commit: entry.commit }, { tag: NEW_TAG, commit: PASS_COMMIT_NEW });
     assert.equal(entry.reason, undefined);
     assert.deepEqual(Object.keys(entry.announcement), ['id', 'title', 'content']);
-    assert.equal(entry.announcement.id, 10217, 'real 2.0.0 upstream bytes must yield its announcement id');
-    assert.equal(entry.announcement.title, '网站公告');
-    assert(entry.announcement.content.includes('### RP-Hub 2.0.0'));
+    // 预期值直接取自锚点版本的真实文件，不随上游版本手工修改。
+    const sourceText = gitBlob(PASS_COMMIT_NEW, ANNOUNCEMENT_SOURCE_PATH).toString('utf8');
+    const announcementSource = sourceText.slice(sourceText.indexOf('window.RPHubLatestUpdate = Object.freeze({'));
+    assert.equal(entry.announcement.id, Number(announcementSource.match(/\bid:\s*(\d+)/)[1]), 'real upstream bytes must yield their announcement id');
+    assert.equal(entry.announcement.title, announcementSource.match(/\btitle:\s*(['"`])(.*?)\1/)[2]);
+    assert(entry.announcement.content.length > 0 && sourceText.includes(entry.announcement.content), 'content must be the verbatim upstream markdown');
     assert(entry.announcement.content.includes('\n'), 'markdown content must keep raw newlines');
-    assert(entry.announcement.content.includes('#### 更新时间：10/09/12:19'));
 }
 
 async function testAnnouncementFailSoftShapes() {
@@ -1239,25 +1246,25 @@ async function testAnnouncementsMirrorManifestAndDelete() {
         updatedAt: FIXED_NOW,
         upstreamRepo: 'STA1N156/RP-Hub',
         versions: [
-            { tag: '2.0.0', commit: PASS_COMMIT_NEW, name: '2.0.0', date: '', publishedAt: FIXED_NOW, files: [] },
-            { tag: '1.9.8', commit: PASS_COMMIT_OLD, name: '1.9.8', date: '', publishedAt: FIXED_NOW - 1, files: [] }
+            { tag: NEW_TAG, commit: PASS_COMMIT_NEW, name: NEW_TAG, date: '', publishedAt: FIXED_NOW, files: [] },
+            { tag: OLD_TAG, commit: PASS_COMMIT_OLD, name: OLD_TAG, date: '', publishedAt: FIXED_NOW - 1, files: [] }
         ],
         pending: []
     });
     bucket.seedText(
-        `snapshots/2.0.0/${PASS_COMMIT_NEW}/${ANNOUNCEMENT_SOURCE_PATH}`,
+        `snapshots/${NEW_TAG}/${PASS_COMMIT_NEW}/${ANNOUNCEMENT_SOURCE_PATH}`,
         'window.RPHubLatestUpdate = Object.freeze({\n    id: 10165,\n    title: \'网站公告\',\n    content: `正文A`\n});\n'
     );
-    bucket.seedText(`snapshots/1.9.8/${PASS_COMMIT_OLD}/${ANNOUNCEMENT_SOURCE_PATH}`, 'const legacy = 1;\n');
+    bucket.seedText(`snapshots/${OLD_TAG}/${PASS_COMMIT_OLD}/${ANNOUNCEMENT_SOURCE_PATH}`, 'const legacy = 1;\n');
     const { result } = await runSync(bucket, {
-        releases: [release('2.0.0', PASS_COMMIT_NEW), release('1.9.8', PASS_COMMIT_OLD)]
+        releases: [release(NEW_TAG, PASS_COMMIT_NEW), release(OLD_TAG, PASS_COMMIT_OLD)]
     });
     assert.equal(result.ok, true);
     assert.equal(result.versionCount, 2);
     const announcements = bucket.json('_mirror/announcements.json');
     assert.deepEqual(
         announcements.entries.map((entry) => [entry.tag, entry.commit]),
-        [['2.0.0', PASS_COMMIT_NEW], ['1.9.8', PASS_COMMIT_OLD]],
+        [[NEW_TAG, PASS_COMMIT_NEW], [OLD_TAG, PASS_COMMIT_OLD]],
         'entries must cover manifest versions one-to-one, in manifest order'
     );
     assert.equal(announcements.entries[0].announcement.id, 10165);
@@ -1267,7 +1274,7 @@ async function testAnnouncementsMirrorManifestAndDelete() {
     const response = await workerFetch(
         adminRequest('/api/versions/delete', {
             method: 'POST',
-            body: JSON.stringify({ tag: '2.0.0', commit: PASS_COMMIT_NEW })
+            body: JSON.stringify({ tag: NEW_TAG, commit: PASS_COMMIT_NEW })
         }),
         adminEnv(bucket)
     );
@@ -1276,7 +1283,7 @@ async function testAnnouncementsMirrorManifestAndDelete() {
     const after = bucket.json('_mirror/announcements.json');
     assert.deepEqual(
         after.entries.map((entry) => entry.tag),
-        ['1.9.8'],
+        [OLD_TAG],
         'deleted version must leave the announcement index'
     );
 }
@@ -1287,14 +1294,14 @@ async function testAnnouncementsPublicRoutes() {
     const missing = await workerFetch(new Request('https://publisher.test/announcements.json'), workerEnv);
     assert.equal(missing.status, 404);
     assert.match((await missing.json()).error, /同步/, '404 body must tell the operator to sync first');
-    const missingFiltered = await workerFetch(new Request('https://publisher.test/announcements.json?tag=2.0.0'), workerEnv);
+    const missingFiltered = await workerFetch(new Request(`https://publisher.test/announcements.json?tag=${NEW_TAG}`), workerEnv);
     assert.equal(missingFiltered.status, 404);
 
     const payload = JSON.stringify({
         generatedAt: FIXED_NOW,
         entries: [
-            { tag: '2.0.0', commit: PASS_COMMIT_NEW, announcement: { id: 10195, title: '网站公告', content: '正文' } },
-            { tag: '1.9.8', commit: PASS_COMMIT_OLD, announcement: null, reason: 'not-found' }
+            { tag: NEW_TAG, commit: PASS_COMMIT_NEW, announcement: { id: 10195, title: '网站公告', content: '正文' } },
+            { tag: OLD_TAG, commit: PASS_COMMIT_OLD, announcement: null, reason: 'not-found' }
         ]
     });
     bucket.seedText('_mirror/announcements.json', payload);
@@ -1304,11 +1311,11 @@ async function testAnnouncementsPublicRoutes() {
     assert.equal(full.headers.get('content-type'), 'application/json; charset=utf-8');
     assert.equal(await full.text(), payload, 'route must stream the sidecar object verbatim');
 
-    const filtered = await workerFetch(new Request('https://publisher.test/announcements.json?tag=2.0.0'), workerEnv);
+    const filtered = await workerFetch(new Request(`https://publisher.test/announcements.json?tag=${NEW_TAG}`), workerEnv);
     assert.equal(filtered.status, 200);
     const filteredValue = await filtered.json();
     assert.equal(filteredValue.generatedAt, FIXED_NOW);
-    assert.deepEqual(filteredValue.entries.map((entry) => entry.tag), ['2.0.0']);
+    assert.deepEqual(filteredValue.entries.map((entry) => entry.tag), [NEW_TAG]);
     assert.equal(filteredValue.entries[0].announcement.id, 10195);
 
     const none = await workerFetch(new Request('https://publisher.test/announcements.json?tag=9.9.9'), workerEnv);
