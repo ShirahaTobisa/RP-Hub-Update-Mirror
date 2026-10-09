@@ -66,6 +66,11 @@ export class FakeR2 {
         return new FakeR2Object(record);
     }
 
+    async list({ prefix = '' } = {}) {
+        const objects = [...this.records.keys()].filter((key) => key.startsWith(prefix)).sort().map((key) => ({ key }));
+        return { objects, truncated: false };
+    }
+
     async delete(keys) {
         for (const key of Array.isArray(keys) ? keys : [keys]) this.records.delete(key);
     }

@@ -16,8 +16,8 @@ const EXPECTED_MODULE_EXPORTS = [
 const STATIC_IMPORT = /^\s*import\b/m;
 const ANY_EXPORT = /^\s*export\s+/gm;
 const DEFAULT_EXPORT = /^\s*export\s+default\b/gm;
-// 测试用的同步入口：打包时去掉 export，只保留 export default。
-const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases', 'syncWorkshop'];
+// 测试要用的函数：打包时去掉 export，只保留 export default。
+const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases', 'submitWorkshopPlugin', 'readPluginManifest'];
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const sourceRoot = path.resolve(scriptDirectory, '..');
@@ -70,12 +70,12 @@ function inlineAppPatcher(workerSource, patcherSource) {
     ].join('\n');
     let bundled = workerSource.replace(importExpression, () => inlinedModule);
     for (const name of SYNC_EXPORT_NAMES) {
-        const syncExport = new RegExp(`^export\\s+async\\s+function\\s+${name}\\b`, 'gm');
+        const syncExport = new RegExp(`^export\\s+((?:async\\s+)?function\\s+${name})\\b`, 'gm');
         const syncExports = bundled.match(syncExport) || [];
         if (syncExports.length !== 1) {
             throw new Error(`Expected exactly one exported ${name}; found ${syncExports.length}.`);
         }
-        bundled = bundled.replace(syncExport, `async function ${name}`);
+        bundled = bundled.replace(syncExport, '$1');
     }
 
     if (STATIC_IMPORT.test(bundled) || /\bimport\s*\(/.test(bundled)) {

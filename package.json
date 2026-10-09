@@ -10,7 +10,7 @@
   },
   "scripts": {
     "test": "node scripts/prepare-test-fixtures.mjs && node tests/mirror-worker.test.mjs && node tests/public-announcements.test.mjs && node tests/test-releases.test.mjs && node tests/workshop.test.mjs",
-    "test:browser": "node tests/public-announcements.browser.mjs",
+    "test:browser": "node tests/public-announcements.browser.mjs && node tests/workshop.browser.mjs",
     "test:package": "node tests/package.test.mjs",
     "build": "node scripts/package.mjs",
     "dev": "wrangler dev --local",

@@ -1545,96 +1545,142 @@ async function serveTestRelease(pathname, env) {
     });
 }
 
-// ---- 插件工坊：同步插件仓库主分支 plugins/<id>/{plugin.json,<id>.js}，供站点「模块管理 → 工坊」安装 ----
-const DEFAULT_WORKSHOP_REPO = 'ShirahaTobisa/RP-Hub-Workshop';
+// ---- 插件工坊：作者在 /workshop/submit 投稿进待审核区，管理员在 /admin 审核上架；插件和目录都存在 R2 ----
 const WORKSHOP_PREFIX = 'workshop';
 const WORKSHOP_INDEX_KEY = `${WORKSHOP_PREFIX}/index.json`;
+const WORKSHOP_PENDING_PREFIX = `${WORKSHOP_PREFIX}/pending/`;
 const WORKSHOP_PLUGIN_PATH_PATTERN = /^\/workshop\/plugins\/([a-z0-9-]{3,32})\.js$/;
-const WORKSHOP_META_PATTERN = /^plugins\/([a-z0-9-]{3,32})\/plugin\.json$/;
-const WORKSHOP_TEXT_LIMITS = { name: 40, version: 32, author: 40, description: 300 };
+const WORKSHOP_PENDING_SOURCE_PATTERN = /^\/api\/workshop\/pending\/([a-f0-9-]{36})\.js$/;
+const WORKSHOP_ID_PATTERN = /^[a-z0-9-]{3,32}$/;
+const WORKSHOP_TEXT_LIMITS = { name: 40, author: 40, description: 300, contact: 100 };
 const MAX_WORKSHOP_PLUGIN_BYTES = 2 * 1024 * 1024;
-const MAX_WORKSHOP_PLUGINS = 200;
+const MAX_WORKSHOP_PENDING = 50;
 const CORS_HEADERS = { 'access-control-allow-origin': '*' };
 
-function workshopRepo(env) {
-    return typeof env?.WORKSHOP_REPO === 'string' && env.WORKSHOP_REPO.trim() ? env.WORKSHOP_REPO.trim() : DEFAULT_WORKSHOP_REPO;
+class WorkshopRequestError extends Error {
+    constructor(message, status = 400) {
+        super(message);
+        this.status = status;
+    }
 }
 
-// 与插件仓库 scripts/validate.mjs 的 plugin.json 规则一致；插件代码本身的检查在合并前由仓库 CI 完成。
-function validateWorkshopMeta(meta, id) {
-    if (!plainObject(meta) || meta.id !== id) throw new Error('plugin.json 的 id 与文件夹名不一致');
+// 从插件源码里读出 register 时写的 id、version、requiresApi；要求写成字面量，真正的加载检查由站点加载器负责。
+export function readPluginManifest(source) {
+    const start = source.indexOf('RPHubSDK.register(');
+    if (start < 0) throw new WorkshopRequestError('插件里没有找到 RPHubSDK.register(');
+    const head = source.slice(start, start + 4000);
+    const text = (key) => head.match(new RegExp(`\\b${key}\\s*:\\s*(['"])([^'"\\n]{1,32})\\1`))?.[2] || '';
+    const id = text('id');
+    const version = text('version');
+    const requiresApi = Number(head.match(/\brequiresApi\s*:\s*(\d{1,3})\b/)?.[1]);
+    if (!WORKSHOP_ID_PATTERN.test(id) || !version || !Number.isInteger(requiresApi) || requiresApi < 1) {
+        throw new WorkshopRequestError('register 里的 id、version、requiresApi 要直接写成固定值；id 只用小写字母、数字和短横线，3～32 个字符');
+    }
+    return { id, version, requiresApi };
+}
+
+function readWorkshopText(body) {
+    const meta = {};
     for (const [key, limit] of Object.entries(WORKSHOP_TEXT_LIMITS)) {
-        if (typeof meta[key] !== 'string' || !meta[key].trim() || meta[key].length > limit) throw new Error(`plugin.json 的 ${key} 无效`);
+        const value = typeof body?.[key] === 'string' ? body[key].trim() : '';
+        if ((key !== 'contact' && !value) || value.length > limit) throw new WorkshopRequestError(`${key} 需要 ${key === 'contact' ? 0 : 1}～${limit} 个字符`);
+        meta[key] = value;
     }
-    if (!Number.isInteger(meta.requiresApi) || meta.requiresApi < 1) throw new Error('plugin.json 的 requiresApi 无效');
+    return meta;
 }
 
-// 主分支没变就跳过；变了逐个读取插件，文件内容没变的不重写。单个插件出错时保留它上一次上架的版本。
-export async function syncWorkshop(env, options = {}) {
-    const fetchImpl = options.fetchImpl || fetch;
-    const now = options.now || Date.now;
-    const bucket = env?.MIRROR_BUCKET;
-    if (!bucket) throw new Error('缺少 MIRROR_BUCKET R2 binding。');
-    const repo = workshopRepo(env);
-    const state = await readJsonObject(bucket, WORKSHOP_INDEX_KEY);
-    const head = await fetchGitHubJson(fetchImpl, env, `https://api.github.com/repos/${repo}/commits/main`);
-    const commit = typeof head?.sha === 'string' ? head.sha.toLowerCase() : '';
-    if (!/^[a-f0-9]{40}$/.test(commit)) throw new Error('插件仓库主分支 commit 无效。');
-    if (state.value?.commit === commit) return { ok: true, changed: false, pluginCount: state.value.plugins?.length || 0 };
-
-    const tree = await fetchGitHubJson(fetchImpl, env, `https://api.github.com/repos/${repo}/git/trees/${commit}?recursive=1`);
-    if (!Array.isArray(tree?.tree) || tree.truncated) throw new Error('插件仓库文件树不完整。');
-    const blobs = new Map(tree.tree.filter((entry) => entry?.type === 'blob').map((entry) => [entry.path, Number(entry.size || 0)]));
-    const ids = [...blobs.keys()].map((path) => path.match(WORKSHOP_META_PATTERN)?.[1]).filter(Boolean).sort().slice(0, MAX_WORKSHOP_PLUGINS);
-    const previous = new Map((Array.isArray(state.value?.plugins) ? state.value.plugins : []).map((plugin) => [plugin.id, plugin]));
-    const plugins = [];
-    const skipped = [];
-    for (const id of ids) {
-        try {
-            const sourcePath = `plugins/${id}/${id}.js`;
-            if (!blobs.has(sourcePath)) throw new Error(`缺少 ${sourcePath}`);
-            if (blobs.get(sourcePath) > MAX_WORKSHOP_PLUGIN_BYTES) throw new Error('插件文件超过 2MB');
-            const meta = JSON.parse(new TextDecoder().decode(await fetchRawFile(fetchImpl, env, repo, commit, `plugins/${id}/plugin.json`)));
-            validateWorkshopMeta(meta, id);
-            const bytes = await fetchRawFile(fetchImpl, env, repo, commit, sourcePath);
-            const sha256 = await sha256Bytes(bytes);
-            const known = previous.get(id);
-            const path = `/${WORKSHOP_PREFIX}/plugins/${id}.js`;
-            if (known?.file?.sha256 !== sha256) {
-                await bucket.put(path.slice(1), bytes, { httpMetadata: { contentType: 'text/javascript; charset=utf-8' } });
-            }
-            plugins.push({
-                id, name: meta.name, version: meta.version, author: meta.author, description: meta.description, requiresApi: meta.requiresApi,
-                updatedAt: known?.file?.sha256 === sha256 ? known.updatedAt : nowValue(now),
-                file: { path, sha256, size: bytes.byteLength }
-            });
-        } catch (error) {
-            skipped.push({ id, reason: toErrorMessage(error) });
-            if (previous.has(id)) plugins.push(previous.get(id));
-        }
+async function listWorkshopPending(bucket) {
+    const listed = await bucket.list({ prefix: WORKSHOP_PENDING_PREFIX });
+    const entries = [];
+    for (const object of listed.objects || []) {
+        if (!object.key.endsWith('.json')) continue;
+        const value = (await readJsonObject(bucket, object.key)).value;
+        if (plainObject(value)) entries.push(value);
     }
-    const kept = new Set(plugins.map((plugin) => plugin.id));
-    const stale = [...previous.keys()].filter((id) => !kept.has(id)).map((id) => `${WORKSHOP_PREFIX}/plugins/${id}.js`);
-    const stored = await bucket.put(WORKSHOP_INDEX_KEY, JSON.stringify({ schema: 1, repo, commit, updatedAt: nowValue(now), plugins, skipped }, null, 2),
+    return entries.sort((left, right) => Number(left.submittedAt || 0) - Number(right.submittedAt || 0));
+}
+
+async function readWorkshopIndexState(bucket) {
+    const state = await readJsonObject(bucket, WORKSHOP_INDEX_KEY);
+    return { object: state.object, plugins: Array.isArray(state.value?.plugins) ? state.value.plugins : [] };
+}
+
+async function writeWorkshopIndex(bucket, state, plugins, now) {
+    const stored = await bucket.put(WORKSHOP_INDEX_KEY, JSON.stringify({ schema: 1, updatedAt: nowValue(now), plugins }, null, 2),
         manifestPutOptions(state.object));
     if (!stored) throw new ManifestConflictError();
-    if (stale.length) await bucket.delete(stale);
-    return { ok: true, changed: true, pluginCount: plugins.length, skipped };
 }
 
-async function syncWorkshopSafely(env, options) {
+// 公开投稿：存进待审核区，不会直接上架。同一插件 id 的旧投稿由新投稿替换。
+export async function submitWorkshopPlugin(request, env, options = {}) {
+    const now = options.now || Date.now;
+    const bucket = env.MIRROR_BUCKET;
+    let body;
     try {
-        return await syncWorkshop(env, options);
+        body = await readJsonRequest(request, MAX_WORKSHOP_PLUGIN_BYTES * 2);
     } catch (error) {
-        console.error(JSON.stringify({ message: 'workshop sync failed', error: safeErrorMessage(error, env) }));
-        return { ok: false, error: safeErrorMessage(error, env) };
+        throw new WorkshopRequestError(error.message);
     }
+    const source = typeof body?.source === 'string' ? body.source : '';
+    const bytes = new TextEncoder().encode(source);
+    if (!source.trim() || bytes.byteLength > MAX_WORKSHOP_PLUGIN_BYTES) throw new WorkshopRequestError('插件文件不能为空，且不能超过 2MB');
+    const manifest = readPluginManifest(source);
+    const meta = readWorkshopText(body);
+    const pending = await listWorkshopPending(bucket);
+    const replaced = pending.filter((entry) => entry.id === manifest.id);
+    if (pending.length - replaced.length >= MAX_WORKSHOP_PENDING) throw new WorkshopRequestError('待审核的投稿已满，请稍后再试', 429);
+    const sid = crypto.randomUUID();
+    const entry = { sid, ...manifest, ...meta, size: bytes.byteLength, sha256: await sha256Bytes(bytes), submittedAt: nowValue(now) };
+    await bucket.put(`${WORKSHOP_PENDING_PREFIX}${sid}.js`, bytes, { httpMetadata: { contentType: 'text/javascript; charset=utf-8' } });
+    await bucket.put(`${WORKSHOP_PENDING_PREFIX}${sid}.json`, JSON.stringify(entry), { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+    if (replaced.length) await bucket.delete(replaced.flatMap((item) => [`${WORKSHOP_PENDING_PREFIX}${item.sid}.js`, `${WORKSHOP_PENDING_PREFIX}${item.sid}.json`]));
+    return { ok: true, sid, id: manifest.id, version: manifest.version };
+}
+
+async function readPendingSubmission(bucket, sid) {
+    if (!/^[a-f0-9-]{36}$/.test(String(sid || ''))) throw new WorkshopRequestError('投稿编号无效');
+    const entry = (await readJsonObject(bucket, `${WORKSHOP_PENDING_PREFIX}${sid}.json`)).value;
+    const source = await bucket.get(`${WORKSHOP_PENDING_PREFIX}${sid}.js`);
+    if (!entry || !source) throw new WorkshopRequestError('投稿不存在或已处理', 404);
+    return { entry, bytes: new Uint8Array(await source.arrayBuffer()) };
+}
+
+// 管理员操作：上架（同 id 覆盖为新版本）、拒绝、下架。
+async function reviewWorkshop(action, request, env, options = {}) {
+    const now = options.now || Date.now;
+    const bucket = env.MIRROR_BUCKET;
+    const body = await readJsonRequest(request);
+    if (action === 'remove') {
+        const state = await readWorkshopIndexState(bucket);
+        const plugins = state.plugins.filter((plugin) => plugin.id !== body?.id);
+        if (plugins.length === state.plugins.length) throw new WorkshopRequestError('插件不在工坊里', 404);
+        await writeWorkshopIndex(bucket, state, plugins, now);
+        await bucket.delete(`${WORKSHOP_PREFIX}/plugins/${body.id}.js`);
+        return { ok: true, removed: body.id };
+    }
+    const { entry, bytes } = await readPendingSubmission(bucket, body?.sid);
+    const pendingKeys = [`${WORKSHOP_PENDING_PREFIX}${entry.sid}.js`, `${WORKSHOP_PENDING_PREFIX}${entry.sid}.json`];
+    if (action === 'reject') {
+        await bucket.delete(pendingKeys);
+        return { ok: true, rejected: entry.sid };
+    }
+    if (await sha256Bytes(bytes) !== entry.sha256) throw new WorkshopRequestError('投稿文件与记录不一致，请拒绝后让作者重新投稿', 409);
+    const path = `/${WORKSHOP_PREFIX}/plugins/${entry.id}.js`;
+    await bucket.put(path.slice(1), bytes, { httpMetadata: { contentType: 'text/javascript; charset=utf-8' } });
+    const state = await readWorkshopIndexState(bucket);
+    const plugin = {
+        id: entry.id, name: entry.name, version: entry.version, author: entry.author, description: entry.description,
+        requiresApi: entry.requiresApi, updatedAt: nowValue(now), file: { path, sha256: entry.sha256, size: entry.size }
+    };
+    const plugins = [...state.plugins.filter((item) => item.id !== entry.id), plugin].sort((left, right) => left.id.localeCompare(right.id));
+    await writeWorkshopIndex(bucket, state, plugins, now);
+    await bucket.delete(pendingKeys);
+    return { ok: true, published: plugin };
 }
 
 async function readWorkshopPlugins(bucket) {
     try {
-        const value = (await readJsonObject(bucket, WORKSHOP_INDEX_KEY)).value;
-        return Array.isArray(value?.plugins) ? value.plugins : [];
+        return (await readWorkshopIndexState(bucket)).plugins;
     } catch {
         return [];
     }
@@ -1653,6 +1699,46 @@ async function serveWorkshop(pathname, env) {
             'x-content-type-options': 'nosniff'
         }
     });
+}
+
+function renderWorkshopSubmitHtml() {
+    return `<!doctype html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>投稿插件 · RP-Hub 插件工坊</title>
+<style>
+:root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d8dde3;--text:#17202a;--muted:#66717d;--accent:#146c43;--danger:#b42318}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}main{width:min(720px,calc(100% - 32px));margin:24px auto 48px}h1{font-size:24px;margin:0 0 8px}.muted{color:var(--muted)}form{display:grid;gap:14px;margin-top:20px;padding:20px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}label{display:grid;gap:6px;font-weight:600}input,textarea{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--text)}textarea{min-height:90px;resize:vertical}button{justify-self:start;font:inherit;font-weight:600;padding:8px 18px;border:0;border-radius:6px;background:var(--accent);color:#fff;cursor:pointer}button:disabled{opacity:.6;cursor:not-allowed}#result{white-space:pre-wrap}.error{color:var(--danger)}ul{padding-left:20px}code{font:12px ui-monospace,Consolas,monospace}
+@media(prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#111417;--panel:#191d21;--line:#343b43;--text:#eef1f4;--muted:#a6afb9;--accent:#2f8f5f;--danger:#ff8a80}}
+</style>
+</head>
+<body>
+<main>
+<h1>投稿插件</h1>
+<p class="muted">投稿进入待审核区，维护者看过代码后上架到工坊；各站点在「模块管理 → 工坊」安装。更新插件也在这里投稿，版本号要改。</p>
+<ul class="muted">
+<li>插件里 <code>RPHubSDK.register({ id: '...', version: '...', requiresApi: 4, ... })</code> 的 id、version、requiresApi 直接写成固定值。id 只用小写字母、数字和短横线，上架后不能改。</li>
+<li>一个插件一个 .js 文件，不超过 2MB，不要混淆或压缩代码。</li>
+<li>不读取、不上传同步密码和生图密钥；需要联网的，在说明里写明会访问哪些地址。</li>
+</ul>
+<form id="form">
+<label>插件文件<input id="file" type="file" accept=".js,text/javascript" required></label>
+<label>名称<input id="name" maxlength="40" required></label>
+<label>作者<input id="author" maxlength="40" required></label>
+<label>说明（做什么、会访问哪些地址）<textarea id="description" maxlength="300" required></textarea></label>
+<label>联系方式（选填，方便审核时联系）<input id="contact" maxlength="100"></label>
+<button id="submit" type="submit">提交审核</button>
+<div id="result" class="muted"></div>
+</form>
+</main>
+<script>
+const byId=(id)=>document.getElementById(id);
+byId('form').addEventListener('submit',async(event)=>{event.preventDefault();const file=byId('file').files[0];const result=byId('result');if(!file)return;if(file.size>2*1024*1024){result.className='error';result.textContent='插件文件不能超过 2MB。';return}byId('submit').disabled=true;result.className='muted';result.textContent='正在提交…';try{const response=await fetch('/api/workshop/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source:await file.text(),name:byId('name').value,author:byId('author').value,description:byId('description').value,contact:byId('contact').value})});const value=await response.json().catch(()=>({}));if(!response.ok)throw new Error(value.error||('HTTP '+response.status));result.className='';result.textContent='已提交：'+value.id+' v'+value.version+'，等待审核。'}catch(error){result.className='error';result.textContent='提交失败：'+error.message}finally{byId('submit').disabled=false}});
+</script>
+</body>
+</html>`;
 }
 
 function effectiveRepo(env) {
@@ -1787,7 +1873,6 @@ async function buildPublicStatus(env) {
         upstreamRepo: statusString(effectiveRepo(env), env, 300),
         testReleases: await readTestReleaseVersions(bucket),
         workshopPlugins: await readWorkshopPlugins(bucket),
-        workshopRepo: statusString(workshopRepo(env), env, 300),
         testReleaseRepo: statusString(testReleaseRepo(env), env, 300)
     };
 }
@@ -1895,6 +1980,8 @@ function renderConsoleHtml(status) {
 </section>
 <section class="band"><h2>已发布版本</h2><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit</th><th>发布时间</th><th>文件数</th><th>操作</th></tr></thead><tbody id="versionsBody">${versionRows(status.manifest.versions)}</tbody></table></div><div id="announcementPanel" class="notice" style="display:none;margin-top:12px"></div></section>
 <section class="band"><h2>Pending</h2><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit</th><th>原因</th><th>详情</th><th>发现时间</th><th>操作</th></tr></thead><tbody id="pendingBody">${pendingRows(status.manifest.pending)}</tbody></table></div></section>
+<section class="band"><h2>插件投稿</h2><p class="stamp">投稿页：<a href="/workshop/submit">/workshop/submit</a>。先点「查看代码」审阅再上架；同一 id 上架会覆盖旧版本。</p><div class="row"><button id="workshopRefresh" class="secondary">刷新工坊</button></div><div class="table-wrap"><table><thead><tr><th>插件</th><th>版本</th><th>作者</th><th>说明 / 联系</th><th>投稿时间</th><th>操作</th></tr></thead><tbody id="workshopPendingBody"><tr><td colspan="6" class="empty">保存管理员令牌后点「刷新工坊」</td></tr></tbody></table></div><pre id="workshopSource" class="notice" style="display:none;max-height:420px;overflow:auto;white-space:pre-wrap"></pre></section>
+<section class="band"><h2>已上架插件</h2><div class="table-wrap"><table><thead><tr><th>插件</th><th>版本</th><th>作者</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="workshopPluginsBody"></tbody></table></div></section>
 </main>
 <script>
 const byId=(id)=>document.getElementById(id);const esc=(value)=>String(value??'').replace(/[&<>"']/g,(character)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));const time=(value)=>{if(!(Number(value)>0))return '尚无记录';const parts=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(Number(value)));const get=(type)=>parts.find((part)=>part.type===type)?.value||'';return get('year')+'-'+get('month')+'-'+get('day')+' '+get('hour')+':'+get('minute')+':'+get('second')+' (UTC+8)'};const configured=(value)=>value?'<span class="configured">已配置</span>':'<span class="missing">未配置</span>';const notice=(message,type='')=>{byId('notice').textContent=message;byId('notice').className='notice '+type};const storedToken=()=>localStorage.getItem('mirrorAdminToken')||'';byId('adminToken').value=storedToken();
@@ -1907,6 +1994,9 @@ let progressTimer=null;function startProgressPolling(){if(progressTimer)return;p
 function syncSummary(result){const parts=[];const published=(result.events||[]).filter((event)=>event==='version_published'||event==='retag_republished').length;const failed=(result.events||[]).filter((event)=>event.indexOf('precheck_failed')>=0).length;if(published)parts.push('本轮上架 '+published+' 个版本');if(failed)parts.push(failed+' 个预检失败转 pending');if(!published&&!failed)parts.push(result.changed?'状态已更新':'无新版本');parts.push('累计已发布 '+result.versionCount+' 个');if(result.snapshotBudget&&result.snapshotBudget.deferred)parts.push('还有版本待回填，请再点一次「立即同步」');return parts.join('；')+'。'}
 async function refresh(){try{render(await api('/api/status'));notice('状态已刷新。','ok')}catch(error){notice(error.message,'error')}}
 byId('saveToken').addEventListener('click',()=>{localStorage.setItem('mirrorAdminToken',byId('adminToken').value.trim());notice('管理员令牌已保存到此浏览器。','ok')});byId('refresh').addEventListener('click',refresh);byId('syncNow').addEventListener('click',async(event)=>{event.currentTarget.disabled=true;notice('正在同步…（下方进度条每 2 秒自动刷新）');startProgressPolling();try{const result=await api('/api/sync',{method:'POST'});notice(result.ok?'同步完成：'+syncSummary(result):'同步失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refresh()}catch(error){notice('同步失败：'+error.message,'error')}finally{event.currentTarget.disabled=false}});byId('webhookTest').addEventListener('click',async(event)=>{event.currentTarget.disabled=true;notice('正在测试 Webhook…');try{const result=await api('/api/webhook-test',{method:'POST'});notice(result.sent?'Webhook 已发送。':(result.disabled?'Webhook 已禁用。':'Webhook 未发送。'),result.sent?'ok':'error')}catch(error){notice(error.message,'error')}finally{event.currentTarget.disabled=false}});byId('configForm').addEventListener('submit',async(event)=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{const config=await api('/api/config',{method:'PUT',body:JSON.stringify({releaseLimit:Number(byId('releaseLimit').value),webhookEnabled:byId('webhookEnabled').checked})});notice('配置已保存。','ok');byId('releaseLimit').value=config.config.releaseLimit}catch(error){notice(error.message,'error')}finally{button.disabled=false}});bindRetry();bindDelete();bindAnnouncements();
+async function refreshWorkshop(){try{const value=await api('/api/workshop/pending');byId('workshopPendingBody').innerHTML=value.pending.length?value.pending.map((item)=>{const current=value.plugins.find((plugin)=>plugin.id===item.id);return '<tr><td>'+esc(item.name)+'<br><code>'+esc(item.id)+'</code></td><td>'+esc(item.version)+'<br><span class="stamp">'+(current?'现为 '+esc(current.version)+'（'+esc(current.author)+'）':'新插件')+'</span></td><td>'+esc(item.author)+'</td><td class="detail">'+esc(item.description)+(item.contact?'<br>联系：'+esc(item.contact):'')+'</td><td>'+esc(time(item.submittedAt))+'</td><td><button class="secondary ws-view" data-sid="'+esc(item.sid)+'">查看代码</button> <button class="ws-approve" data-sid="'+esc(item.sid)+'">上架</button> <button class="secondary ws-reject" data-sid="'+esc(item.sid)+'">拒绝</button></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">没有待审核的投稿</td></tr>';byId('workshopPluginsBody').innerHTML=value.plugins.length?value.plugins.map((plugin)=>'<tr><td>'+esc(plugin.name)+'<br><code>'+esc(plugin.id)+'</code></td><td>'+esc(plugin.version)+'</td><td>'+esc(plugin.author)+'</td><td>'+esc(time(plugin.updatedAt))+'</td><td><a href="'+esc(plugin.file.path)+'" target="_blank" rel="noopener">源码</a> <button class="secondary ws-remove" data-id="'+esc(plugin.id)+'">下架</button></td></tr>').join(''):'<tr><td colspan="5" class="empty">工坊暂无插件</td></tr>';bindWorkshop();notice('工坊已刷新。','ok')}catch(error){notice(error.message,'error')}}
+function bindWorkshop(){const act=(selector,handler)=>document.querySelectorAll(selector).forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;try{await handler(button.dataset)}catch(error){notice(error.message,'error')}finally{button.disabled=false}}));act('.ws-view',async({sid})=>{const response=await fetch('/api/workshop/pending/'+sid+'.js',{headers:{authorization:'Bearer '+storedToken()}});if(!response.ok)throw new Error('HTTP '+response.status);const box=byId('workshopSource');box.textContent=await response.text();box.style.display='';box.scrollIntoView({block:'nearest'})});act('.ws-approve',async({sid})=>{if(!confirm('确认上架？插件会拥有安装它的站点的全部权限。'))return;const result=await api('/api/workshop/approve',{method:'POST',body:JSON.stringify({sid})});await refreshWorkshop();notice('已上架 '+result.published.id+' v'+result.published.version+'。','ok')});act('.ws-reject',async({sid})=>{if(!confirm('确认拒绝这条投稿？'))return;await api('/api/workshop/reject',{method:'POST',body:JSON.stringify({sid})});await refreshWorkshop()});act('.ws-remove',async({id})=>{if(!confirm('确认下架 '+id+'？已经装了的站点不受影响，但工坊里不再显示。'))return;await api('/api/workshop/remove',{method:'POST',body:JSON.stringify({id})});await refreshWorkshop()})}
+byId('workshopRefresh').addEventListener('click',refreshWorkshop);if(storedToken())refreshWorkshop();
 </script>
 </body>
 </html>`;
@@ -1996,7 +2086,7 @@ a{color:var(--accent)}.announcement-link{display:inline-block;white-space:nowrap
 ${announcement}
 <section class="band"><h2>可更新版本</h2><p class="muted">点击“查看公告”可直接获取各版本公告，无需管理员口令。在站点更新页面点击“检测版本”即可获取最新清单。</p><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit（前 12 位）</th><th>上游日期</th><th>上架时间</th><th>文件数</th></tr></thead><tbody>${versions}</tbody></table></div></section>
 <section class="band"><h2>测试版</h2><p class="muted">来自 <b>${escapeHtml(status.testReleaseRepo || '')}</b>。设置了 CF_API_TOKEN 的站点可在更新页面一键更新；其他站点下载部署包后手动上传到 Cloudflare Pages。</p><div class="table-wrap"><table><thead><tr><th>版本</th><th>发布时间</th><th>更新说明</th><th>下载</th></tr></thead><tbody>${testReleases}</tbody></table></div></section>
-<section class="band"><h2>插件工坊</h2><p class="muted">来自 <b>${escapeHtml(status.workshopRepo || '')}</b>，经审核后上架。测试版站点可在「模块管理 → 工坊」一键安装；投稿方式见插件仓库说明。插件拥有页面全部权限，请只安装信任的插件。</p><div class="table-wrap"><table><thead><tr><th>插件</th><th>版本</th><th>作者</th><th>说明</th><th>源码</th></tr></thead><tbody>${workshopPlugins}</tbody></table></div></section>
+<section class="band"><h2>插件工坊</h2><p class="muted">经审核后上架，测试版站点可在「模块管理 → 工坊」一键安装。想发布自己的插件：<a href="/workshop/submit">投稿插件</a>。插件拥有页面全部权限，请只安装信任的插件。</p><div class="table-wrap"><table><thead><tr><th>插件</th><th>版本</th><th>作者</th><th>说明</th><th>源码</th></tr></thead><tbody>${workshopPlugins}</tbody></table></div></section>
 <section class="band"><h2>暂不可用版本</h2><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit（前 12 位）</th><th>原因</th><th>发现时间</th></tr></thead><tbody>${pending}</tbody></table></div></section>
 <footer>清单可直接访问：<code>/manifest.json</code>、<code>/test-releases/manifest.json</code>、<code>/workshop/index.json</code></footer>
 </main>
@@ -2240,7 +2330,7 @@ async function handleRequest(request, env, options = {}) {
             return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
         }
     }
-    if (request.method === 'GET' && url.pathname.startsWith(`/${WORKSHOP_PREFIX}/`)) {
+    if (request.method === 'GET' && url.pathname.startsWith(`/${WORKSHOP_PREFIX}/`) && url.pathname !== '/workshop/submit') {
         try {
             return await serveWorkshop(url.pathname, env);
         } catch (error) {
@@ -2288,6 +2378,44 @@ async function handleRequest(request, env, options = {}) {
             return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
         }
     }
+    if (request.method === 'GET' && url.pathname === '/workshop/submit') {
+        return new Response(renderWorkshopSubmitHtml(), {
+            headers: {
+                'cache-control': 'no-store',
+                'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                'content-type': 'text/html; charset=utf-8',
+                'referrer-policy': 'no-referrer',
+                'x-content-type-options': 'nosniff',
+                'x-frame-options': 'DENY'
+            }
+        });
+    }
+    if (request.method === 'POST' && url.pathname === '/api/workshop/submit') {
+        try {
+            return jsonResponse(await submitWorkshopPlugin(request, env, runtimeOptions));
+        } catch (error) {
+            return jsonResponse({ ok: false, error: error instanceof WorkshopRequestError ? error.message : safeErrorMessage(error, env) }, { status: error.status || 500 });
+        }
+    }
+    const workshopAdminRoute = (request.method === 'GET' && (url.pathname === '/api/workshop/pending' || WORKSHOP_PENDING_SOURCE_PATTERN.test(url.pathname)))
+        || (request.method === 'POST' && ['/api/workshop/approve', '/api/workshop/reject', '/api/workshop/remove'].includes(url.pathname));
+    if (workshopAdminRoute) {
+        const forbidden = await authorizeWrite(request, env);
+        if (forbidden) return forbidden;
+        try {
+            if (url.pathname === '/api/workshop/pending') {
+                return jsonResponse({ ok: true, pending: await listWorkshopPending(env.MIRROR_BUCKET), plugins: await readWorkshopPlugins(env.MIRROR_BUCKET) });
+            }
+            const sourceMatch = url.pathname.match(WORKSHOP_PENDING_SOURCE_PATTERN);
+            if (sourceMatch) {
+                const { bytes } = await readPendingSubmission(env.MIRROR_BUCKET, sourceMatch[1]);
+                return new Response(bytes, { headers: { 'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' } });
+            }
+            return jsonResponse(await reviewWorkshop(url.pathname.split('/').pop(), request, env, runtimeOptions));
+        } catch (error) {
+            return jsonResponse({ ok: false, error: error instanceof WorkshopRequestError ? error.message : safeErrorMessage(error, env) }, { status: error.status || 400 });
+        }
+    }
     const writeRoute = (
         (request.method === 'POST' && ['/api/sync', '/api/pending/retry', '/api/versions/delete', '/api/webhook-test'].includes(url.pathname))
         || (request.method === 'PUT' && url.pathname === '/api/config')
@@ -2300,8 +2428,7 @@ async function handleRequest(request, env, options = {}) {
                 const result = await syncMirror(env, runtimeOptions);
                 return jsonResponse({
                     ...result,
-                    testReleases: await syncTestReleasesSafely(env, runtimeOptions),
-                    workshop: await syncWorkshopSafely(env, runtimeOptions)
+                    testReleases: await syncTestReleasesSafely(env, runtimeOptions)
                 });
             }
             if (url.pathname === '/api/pending/retry') return await retryPending(request, env, runtimeOptions);
@@ -2335,9 +2462,6 @@ export default {
         }));
         ctx.waitUntil(syncTestReleasesSafely(env).then((result) => {
             console.log(JSON.stringify({ message: 'test release scheduled sync complete', cron: controller.cron, ...result }));
-        }));
-        ctx.waitUntil(syncWorkshopSafely(env).then((result) => {
-            console.log(JSON.stringify({ message: 'workshop scheduled sync complete', cron: controller.cron, ...result }));
         }));
     }
 };

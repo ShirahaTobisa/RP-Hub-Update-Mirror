@@ -8,7 +8,6 @@ compatibility_flags = ["nodejs_compat"]
 UPSTREAM_REPO = "STA1N156/RP-Hub"
 RELEASE_LIMIT = "12"
 TEST_RELEASE_REPO = "ShirahaTobisa/RP-Hub"
-WORKSHOP_REPO = "ShirahaTobisa/RP-Hub-Workshop"
 
 [observability]
 enabled = true
