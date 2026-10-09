@@ -2199,7 +2199,7 @@ ${olderVersions}
 ${pending}
 </section>
 <section id="test-builds" class="block" aria-labelledby="test-title">
-<div class="block-head"><div><h2 id="test-title">测试版</h2><p class="muted small">来自 ${escapeHtml(status.testReleaseRepo || '')}。设置了 CF_API_TOKEN 的站点在「云同步 → 测试版更新」一键更新；其他站点下载部署包后上传到 Cloudflare Pages。</p></div></div>
+<div class="block-head"><div><h2 id="test-title">测试版</h2><p class="muted small">来自 ${escapeHtml(status.testReleaseRepo || '')}。设置了 CF_API_TOKEN 的站点在「云同步 → 测试版更新」一键更新；其他站点下载部署包后上传到 Cloudflare Pages。第一次部署见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/docs/INSTALL.md">安装与更新</a>。</p></div></div>
 ${tests}
 </section>
 <section id="workshop" class="block" aria-labelledby="workshop-title">
