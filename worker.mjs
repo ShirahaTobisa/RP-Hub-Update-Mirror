@@ -1701,44 +1701,55 @@ async function serveWorkshop(pathname, env) {
     });
 }
 
+// 选好文件就在浏览器里读出 register 的 id/version/requiresApi，对照工坊目录判断新插件还是更新；规则与服务端 readPluginManifest 一致。
+const SUBMIT_SCRIPT = String.raw`
+const byId=(id)=>document.getElementById(id);const MAX=2*1024*1024;let source='';let catalog=[];
+fetch('/workshop/index.json').then((r)=>r.ok?r.json():{plugins:[]}).then((v)=>{catalog=v.plugins||[];if(source)inspect()}).catch(()=>{});
+function readManifest(text){const at=text.indexOf('RPHubSDK.register(');if(at<0)return{error:'插件里没有找到 RPHubSDK.register(。'};const head=text.slice(at,at+4000);const pick=(key)=>(head.match(new RegExp('\\b'+key+'\\s*:\\s*([\'"])([^\'"\\n]{1,40})\\1'))||[])[2]||'';const id=pick('id'),version=pick('version'),name=pick('name');const api=Number((head.match(/\brequiresApi\s*:\s*(\d{1,3})\b/)||[])[1]);if(!/^[a-z0-9-]{3,32}$/.test(id)||!version||!api)return{error:'register 里的 id、version、requiresApi 要直接写成固定值；id 只用小写字母、数字和短横线，3～32 个字符。'};return{id,version,name,requiresApi:api}}
+function check(kind,message){const box=byId('check');box.className='notice '+kind;box.textContent=message;box.hidden=false}
+function inspect(){const manifest=readManifest(source);byId('submit').disabled=true;if(manifest.error){byId('detected').hidden=true;check('error',manifest.error);return}const current=catalog.find((plugin)=>plugin.id===manifest.id);byId('dId').textContent=manifest.id;byId('dVersion').textContent=manifest.version;byId('dApi').textContent='API '+manifest.requiresApi;byId('dKind').textContent=current?'更新：工坊现有 v'+current.version+'（'+current.author+'）':'新插件';byId('dKind').className='badge '+(current?'warn':'ok');byId('detected').hidden=false;if(!byId('name').value&&(manifest.name||current))byId('name').value=(current&&current.name)||manifest.name;if(!byId('author').value&&current)byId('author').value=current.author;if(current&&current.version===manifest.version){check('warn','版本号和工坊里已上架的版本相同。更新插件请先改 register 里的 version。');return}check('ok','格式检查通过，填好下面的信息后提交审核。');byId('submit').disabled=false}
+byId('file').addEventListener('change',async()=>{const file=byId('file').files[0];source='';byId('detected').hidden=true;byId('submit').disabled=true;if(!file){byId('check').hidden=true;return}if(file.size>MAX){check('error','插件文件不能超过 2MB。');return}source=await file.text();inspect()});
+byId('description').addEventListener('input',()=>{byId('descCount').textContent=byId('description').value.length+' / 300'});
+byId('form').addEventListener('submit',async(event)=>{event.preventDefault();if(!source)return;byId('submit').disabled=true;check('','正在提交…');try{const response=await fetch('/api/workshop/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source,name:byId('name').value,author:byId('author').value,description:byId('description').value,contact:byId('contact').value})});const value=await response.json().catch(()=>({}));if(!response.ok)throw new Error(value.error||('HTTP '+response.status));byId('form').hidden=true;byId('doneText').textContent=value.id+' v'+value.version+' 已进入待审核。审核通过后会出现在首页的插件工坊里；同一插件再次投稿会替换这次的投稿。';byId('done').hidden=false}catch(error){check('error','提交失败：'+error.message);byId('submit').disabled=false}});
+byId('again').addEventListener('click',()=>{location.reload()});
+`;
+
 function renderWorkshopSubmitHtml() {
-    return `<!doctype html>
-<html lang="zh-Hans">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>投稿插件 · RP-Hub 插件工坊</title>
-<style>
-:root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d8dde3;--text:#17202a;--muted:#66717d;--accent:#146c43;--danger:#b42318}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}main{width:min(720px,calc(100% - 32px));margin:24px auto 48px}h1{font-size:24px;margin:0 0 8px}.muted{color:var(--muted)}form{display:grid;gap:14px;margin-top:20px;padding:20px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}label{display:grid;gap:6px;font-weight:600}input,textarea{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--text)}textarea{min-height:90px;resize:vertical}button{justify-self:start;font:inherit;font-weight:600;padding:8px 18px;border:0;border-radius:6px;background:var(--accent);color:#fff;cursor:pointer}button:disabled{opacity:.6;cursor:not-allowed}#result{white-space:pre-wrap}.error{color:var(--danger)}ul{padding-left:20px}code{font:12px ui-monospace,Consolas,monospace}
-@media(prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#111417;--panel:#191d21;--line:#343b43;--text:#eef1f4;--muted:#a6afb9;--accent:#2f8f5f;--danger:#ff8a80}}
-</style>
-</head>
-<body>
-<main>
+    const main = `<div class="submit-layout">
+<section>
 <h1>投稿插件</h1>
-<p class="muted">投稿进入待审核区，维护者看过代码后上架到工坊；各站点在「模块管理 → 工坊」安装。更新插件也在这里投稿，版本号要改。</p>
-<ul class="muted">
-<li>插件里 <code>RPHubSDK.register({ id: '...', version: '...', requiresApi: 4, ... })</code> 的 id、version、requiresApi 直接写成固定值。id 只用小写字母、数字和短横线，上架后不能改。</li>
-<li>一个插件一个 .js 文件，不超过 2MB，不要混淆或压缩代码。</li>
-<li>不读取、不上传同步密码和生图密钥；需要联网的，在说明里写明会访问哪些地址。</li>
-</ul>
-<form id="form">
-<label>插件文件<input id="file" type="file" accept=".js,text/javascript" required></label>
-<label>名称<input id="name" maxlength="40" required></label>
-<label>作者<input id="author" maxlength="40" required></label>
-<label>说明（做什么、会访问哪些地址）<textarea id="description" maxlength="300" required></textarea></label>
-<label>联系方式（选填，方便审核时联系）<input id="contact" maxlength="100"></label>
-<button id="submit" type="submit">提交审核</button>
-<div id="result" class="muted"></div>
+<p class="lead">上传插件后进入待审核，维护者看过代码再上架到插件工坊。更新已有插件也在这里提交。</p>
+<form id="form" class="card pad form" style="margin-top:20px">
+<label class="field">插件文件<small>一个 .js 文件，不超过 2MB</small><input id="file" type="file" accept=".js,text/javascript" required></label>
+<div id="detected" class="detected" hidden><div class="meta"><span>id <code id="dId"></code></span><span>版本 <b id="dVersion"></b></span><span id="dApi"></span></div><span id="dKind" class="badge"></span></div>
+<p id="check" class="notice" hidden></p>
+<label class="field">名称<input id="name" maxlength="40" required></label>
+<label class="field">作者<input id="author" maxlength="40" required></label>
+<label class="field">说明<small>插件做什么；需要联网的写明会访问哪些地址。<span id="descCount">0 / 300</span></small><textarea id="description" maxlength="300" required></textarea></label>
+<label class="field">联系方式<small>选填，方便审核时联系你</small><input id="contact" maxlength="100"></label>
+<div class="actions"><button id="submit" class="btn primary" type="submit" disabled>提交审核</button></div>
 </form>
-</main>
-<script>
-const byId=(id)=>document.getElementById(id);
-byId('form').addEventListener('submit',async(event)=>{event.preventDefault();const file=byId('file').files[0];const result=byId('result');if(!file)return;if(file.size>2*1024*1024){result.className='error';result.textContent='插件文件不能超过 2MB。';return}byId('submit').disabled=true;result.className='muted';result.textContent='正在提交…';try{const response=await fetch('/api/workshop/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source:await file.text(),name:byId('name').value,author:byId('author').value,description:byId('description').value,contact:byId('contact').value})});const value=await response.json().catch(()=>({}));if(!response.ok)throw new Error(value.error||('HTTP '+response.status));result.className='';result.textContent='已提交：'+value.id+' v'+value.version+'，等待审核。'}catch(error){result.className='error';result.textContent='提交失败：'+error.message}finally{byId('submit').disabled=false}});
-</script>
-</body>
-</html>`;
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>已提交</h2><p id="doneText" class="notes"></p><div class="actions" style="margin-top:12px"><a class="btn primary" href="/#workshop">查看插件工坊</a><button id="again" class="btn" type="button">再投一个</button></div></div>
+</section>
+<aside class="card pad side">
+<h2>投稿须知</h2>
+<ul>
+<li><code>RPHubSDK.register({ id: '…', version: '…', requiresApi: 4, … })</code> 里的 id、version、requiresApi 直接写成固定值。</li>
+<li>id 只用小写字母、数字和短横线，上架后不能改；更新时改 version。</li>
+<li>不读取、不上传同步密码和生图密钥；需要联网的在说明里写清楚。</li>
+<li>不要混淆或压缩代码，审核时要能看懂。</li>
+</ul>
+<h2>审核流程</h2>
+<ol>
+<li>提交后进入待审核区。</li>
+<li>维护者阅读代码，决定上架或拒绝。</li>
+<li>上架后出现在首页的插件工坊，站点在「模块管理 → 工坊」安装。</li>
+</ol>
+<p class="small muted">接口说明见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/WORKSHOP-MOD-GUIDE.md">工坊开发指南</a>，示范插件见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/examples/api-demo-module.js">api-demo-module.js</a>。</p>
+</aside>
+</div>`;
+    const css = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:4px 0}.detected{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-radius:10px;background:var(--surface-2)}@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
+    return renderShell({ title: '投稿插件', active: '/workshop/submit', main, css, script: SUBMIT_SCRIPT });
 }
 
 function effectiveRepo(env) {
@@ -1904,102 +1915,188 @@ function formatStatusTime(value) {
     return `${valueOf('year')}-${valueOf('month')}-${valueOf('day')} ${valueOf('hour')}:${valueOf('minute')}:${valueOf('second')} (UTC+8)`;
 }
 
-function versionRows(versions) {
-    if (!versions.length) return '<tr><td colspan="5" class="empty">尚无已发布版本</td></tr>';
-    return versions.map((version) => `<tr>
-        <td>${escapeHtml(version.tag)}</td>
-        <td><code>${escapeHtml(version.commit)}</code></td>
-        <td>${escapeHtml(formatStatusTime(version.publishedAt))}</td>
-        <td>${Number(version.fileCount) || 0}</td>
-        <td><button class="secondary show-announcement" data-tag="${escapeHtml(version.tag)}">公告</button> <button class="secondary delete-version" data-tag="${escapeHtml(version.tag)}" data-commit="${escapeHtml(version.commit)}">删除</button></td>
-    </tr>`).join('');
-}
+// ---- 页面外观：首页、投稿页、管理页共用一套样式和顶栏，跟随系统浅色/深色 ----
+const SITE_CSS = String.raw`
+:root{color-scheme:light;--bg:#f5f7fb;--surface:#fff;--surface-2:#f1f4f9;--line:#e3e8ef;--text:#111827;--muted:#64748b;--primary:#2563eb;--primary-soft:#e8f0fe;--primary-text:#1d4ed8;--ok:#15803d;--ok-soft:#e7f6ec;--warn:#b45309;--warn-soft:#fdf3e1;--danger:#b91c1c;--danger-soft:#fdecec;--radius:12px;--shadow:0 1px 2px rgba(16,24,40,.05),0 10px 28px -16px rgba(16,24,40,.18)}
+@media(prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0f1115;--surface:#171a21;--surface-2:#1e222b;--line:#2a2f3a;--text:#e6e8ec;--muted:#9aa3b2;--primary:#3b82f6;--primary-soft:#1c2a44;--primary-text:#9cc2ff;--ok:#4ade80;--ok-soft:#14301f;--warn:#fbbf24;--warn-soft:#33270f;--danger:#f87171;--danger-soft:#3a1717;--shadow:none}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;letter-spacing:0}
+a{color:var(--primary-text);text-decoration:none}a:hover{text-decoration:underline}
+[hidden]{display:none!important}
+.wrap{width:min(1080px,calc(100% - 32px));margin:0 auto}
+.topbar{position:sticky;top:0;z-index:20;background:var(--surface);border-bottom:1px solid var(--line)}
+.topbar-inner{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:56px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--text);white-space:nowrap}.brand:hover{text-decoration:none}
+.brand-mark{display:grid;place-items:center;width:28px;height:28px;border-radius:8px;background:var(--primary);color:#fff;font-size:14px;font-weight:800}
+.site-nav{display:flex;gap:4px;overflow-x:auto}
+.site-nav a{padding:6px 12px;border-radius:8px;color:var(--muted);white-space:nowrap}
+.site-nav a:hover{background:var(--surface-2);color:var(--text);text-decoration:none}
+.site-nav a[aria-current=page]{background:var(--primary-soft);color:var(--primary-text);font-weight:600}
+main{padding:28px 0 40px}
+h1{font-size:26px;line-height:1.3;margin:0 0 6px}h2{font-size:18px;margin:0}h3{font-size:16px;margin:0}
+.lead{margin:0;color:var(--muted)}.muted{color:var(--muted)}.small{font-size:13px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:20px 0 4px}
+.stat{display:block;padding:14px 16px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow);color:var(--text)}
+a.stat:hover{border-color:var(--primary);text-decoration:none}
+.stat span{display:block;color:var(--muted);font-size:13px}.stat b{display:block;font-size:20px;overflow-wrap:anywhere}
+.block{margin-top:32px;scroll-margin-top:72px}
+.block-head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:8px 16px;margin-bottom:12px}
+.block-head p{margin:4px 0 0}
+.card{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow)}
+.pad{padding:16px 18px}
+.list{list-style:none;margin:0;padding:0}
+.list>li{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:12px 16px;border-top:1px solid var(--line)}
+.list>li:first-child{border-top:0}
+.grow{flex:1 1 240px;min-width:0}
+.meta{display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--muted);font-size:13px}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;line-height:1.7;background:var(--surface-2);color:var(--muted);vertical-align:middle;white-space:nowrap}
+.badge.primary{background:var(--primary-soft);color:var(--primary-text)}.badge.ok{background:var(--ok-soft);color:var(--ok)}.badge.warn{background:var(--warn-soft);color:var(--warn)}.badge.danger{background:var(--danger-soft);color:var(--danger)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:36px;padding:7px 14px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--primary);text-decoration:none}.btn:disabled{opacity:.5;cursor:not-allowed;border-color:var(--line)}
+.btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.btn.danger{color:var(--danger)}.btn.danger:hover{border-color:var(--danger)}
+.btn.small{min-height:30px;padding:4px 10px;font-size:13px}
+.actions{display:flex;flex-wrap:wrap;gap:8px}
+.notes{margin:8px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
+details.more{margin-top:12px}details.more>summary{cursor:pointer;color:var(--primary-text);font-weight:600;padding:4px 0}
+details.more .list{margin-top:8px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface)}
+.plugins{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:12px}
+.plugin{display:flex;flex-direction:column;gap:8px;padding:16px 18px}
+.plugin p{margin:0;flex:1;color:var(--muted);overflow-wrap:anywhere}
+.plugin-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+code,pre{font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+.empty{padding:28px 16px;text-align:center;color:var(--muted)}
+.list>li.empty{display:block}
+.notice{padding:10px 14px;border-radius:10px;background:var(--surface-2);color:var(--text);overflow-wrap:anywhere}
+.notice.ok{background:var(--ok-soft);color:var(--ok)}.notice.error{background:var(--danger-soft);color:var(--danger)}.notice.warn{background:var(--warn-soft);color:var(--warn)}
+#announcement{margin-top:24px;padding:18px 20px;scroll-margin-top:72px;border-color:var(--primary)}
+#announcement h3{margin:12px 0 4px}#announcement pre{margin:8px 0 14px;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.8}
+label.field{display:grid;gap:6px;font-weight:600}
+label.field small{font-weight:400;color:var(--muted)}
+input,textarea,select{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);font:inherit}
+input:focus,textarea:focus{outline:2px solid color-mix(in srgb,var(--primary) 45%,transparent);outline-offset:1px;border-color:var(--primary)}
+input[type=checkbox]{width:auto}
+textarea{min-height:96px;resize:vertical}
+.form{display:grid;gap:16px}
+.footer{padding:20px 0 32px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+.footer code{font-size:12px}
+@media(max-width:640px){.wrap{width:calc(100% - 24px)}h1{font-size:22px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stat{padding:10px 12px}.stat span{font-size:12px}.stat b{font-size:14px}.topbar-inner{flex-direction:column;align-items:flex-start;gap:6px;padding:10px 0}.list>li{padding:12px}.pad{padding:14px}}
+`;
 
-function pendingRows(pending) {
-    if (!pending.length) return '<tr><td colspan="6" class="empty">当前没有 pending</td></tr>';
-    return pending.map((item) => `<tr>
-        <td>${escapeHtml(item.tag)}</td>
-        <td><code>${escapeHtml(item.commit)}</code></td>
-        <td>${escapeHtml(item.reason)}</td>
-        <td class="detail">${escapeHtml(item.detail)}</td>
-        <td>${escapeHtml(formatStatusTime(item.seenAt))}</td>
-        <td><button class="secondary retry" data-tag="${escapeHtml(item.tag)}" data-commit="${escapeHtml(item.commit)}">重试</button></td>
-    </tr>`).join('');
-}
+const SITE_NAV = [['/', '首页'], ['/workshop/submit', '投稿插件'], ['/admin', '管理']];
 
-function configuredLabel(value) {
-    return value ? '<span class="configured">已配置</span>' : '<span class="missing">未配置</span>';
-}
-
-function renderConsoleHtml(status) {
-    const manifestState = status.manifest.valid ? '正常' : '格式无效';
-    const syncErrorText = status.syncError
-        ? `${status.syncError.valid ? '存在同步错误' : '错误状态格式无效'} · ${formatStatusTime(status.syncError.at)}`
-        : '无同步错误';
-    const syncErrorDetail = status.syncError?.detail
-        ? `${status.syncError.tag ? `[${status.syncError.tag}] ` : ''}${status.syncError.detail}`
-        : '';
-    const progressText = status.syncProgress
-        ? `${status.syncProgress.state === 'running' ? '进行中' : (status.syncProgress.state === 'done' ? '已完成' : '出错')} · 第 ${status.syncProgress.step} 步：${status.syncProgress.phase}${status.syncProgress.detail ? ` — ${status.syncProgress.detail}` : ''} · ${formatStatusTime(status.syncProgress.at)}`
-        : '尚未同步过';
+function renderShell({ title, active, main, css = '', script = '' }) {
+    const nav = SITE_NAV.map(([href, label]) => `<a href="${href}"${href === active ? ' aria-current="page"' : ''}>${label}</a>`).join('');
     return `<!doctype html>
 <html lang="zh-Hans">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>RP-Hub 镜像发布端</title>
-<style>
-:root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d8dde3;--text:#17202a;--muted:#66717d;--accent:#146c43;--danger:#b42318;--button:#1f2937;--buttonText:#fff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:0}header{background:#fff;border-bottom:1px solid var(--line)}.wrap{width:min(1180px,calc(100% - 32px));margin:auto}.top{min-height:68px;display:flex;align-items:center;justify-content:space-between;gap:16px}h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 14px}.stamp{color:var(--muted);font-size:12px}main{padding:22px 0 40px}.band{padding:20px 0;border-bottom:1px solid var(--line)}.band:last-child{border-bottom:0}.summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{min-height:78px;padding:12px;border:1px solid var(--line);border-radius:6px;background:var(--panel)}.metric b{display:block;font-size:18px;margin-top:4px;overflow-wrap:anywhere}.label{color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:20px}.controls{display:grid;gap:14px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}label{font-weight:600}input[type=password],input[type=number]{height:38px;border:1px solid #aeb6bf;border-radius:5px;background:var(--panel);color:var(--text);padding:0 10px}input[type=password]{width:min(360px,100%)}input[type=number]{width:84px}button{height:38px;border:1px solid var(--button);border-radius:5px;background:var(--button);color:var(--buttonText);padding:0 14px;font-weight:650;cursor:pointer}button.secondary{background:var(--panel);color:var(--text);border-color:#98a2ad}button:disabled{cursor:wait;opacity:.55}.secret-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.secret{display:flex;justify-content:space-between;gap:12px;padding:9px 10px;border:1px solid var(--line);border-radius:5px}.configured{color:var(--accent);font-weight:700}.missing{color:var(--danger);font-weight:700}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}table{width:100%;border-collapse:collapse;min-width:720px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{background:#eef1f4;color:#3d4854;font-size:12px}tr:last-child td{border-bottom:0}code{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.detail{max-width:420px;white-space:normal}.empty{text-align:center;color:var(--muted);padding:24px}.notice{min-height:42px;margin-bottom:14px;padding:10px 12px;border-left:4px solid #6b7280;background:#e9edf1;white-space:pre-wrap}.notice.ok{border-color:var(--accent);background:#e7f5ed}.notice.error{border-color:var(--danger);background:#fdeceb}.switch{display:inline-flex;align-items:center;gap:8px}pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted)}@media(max-width:800px){.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.grid{grid-template-columns:1fr}.secret-grid{grid-template-columns:1fr}.wrap{width:min(100% - 20px,1180px)}}@media(prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#111417;--panel:#191d21;--line:#343b43;--text:#eef1f4;--muted:#a6afb9;--button:#eef1f4;--buttonText:#111417}header{background:#191d21}th{background:#252b31}.notice{background:#242a30}.notice.ok{background:#153225}.notice.error{background:#3a1e1c}input[type=password],input[type=number]{border-color:#59636e}}
-</style>
+<title>${escapeHtml(title)} · RP-Hub 分发站</title>
+<style>${SITE_CSS}${css}</style>
 </head>
 <body>
-<header><div class="wrap top"><h1>RP-Hub 镜像发布端</h1><span id="pageStamp" class="stamp">${escapeHtml(formatStatusTime(Date.now()))}</span></div></header>
+<header class="topbar"><div class="wrap topbar-inner"><a class="brand" href="/"><span class="brand-mark">R</span>RP-Hub 分发站</a><nav class="site-nav">${nav}</nav></div></header>
 <main class="wrap">
-<div id="notice" class="notice">就绪</div>
-<section class="band"><div class="summary">
-<div class="metric"><span class="label">Manifest</span><b id="manifestState">${escapeHtml(manifestState)}</b></div>
-<div class="metric"><span class="label">最后更新</span><b id="updatedAt">${escapeHtml(formatStatusTime(status.manifest.updatedAt))}</b></div>
-<div class="metric"><span class="label">已发布 / Pending</span><b id="counts">${status.manifest.versions.length} / ${status.manifest.pending.length}</b></div>
-<div class="metric"><span class="label">同步错误</span><b id="syncError">${escapeHtml(syncErrorText)}</b></div>
-</div>
-<div id="syncProgress" class="notice" style="margin-top:12px">同步进度：${escapeHtml(progressText)}</div>
-<div id="syncErrorDetail" class="notice error" style="margin-top:12px${syncErrorDetail ? '' : ';display:none'}">${escapeHtml(syncErrorDetail)}</div></section>
-<section class="band grid">
-<div class="controls">
-<div><h2>管理员令牌</h2><div class="row"><input id="adminToken" type="password" autocomplete="off" aria-label="管理员令牌"><button id="saveToken" class="secondary">保存令牌</button></div></div>
-<div><h2>运行时配置</h2><form id="configForm" class="row"><label for="releaseLimit">Release 数量</label><input id="releaseLimit" type="number" min="1" max="12" step="1" value="${status.config.releaseLimit}"><label class="switch"><input id="webhookEnabled" type="checkbox"${status.config.webhookEnabled ? ' checked' : ''}>Webhook</label><button type="submit">保存配置</button></form></div>
-<div><h2>操作</h2><div class="row"><button id="syncNow">立即同步</button><button id="webhookTest" class="secondary">测试 Webhook</button><button id="refresh" class="secondary">刷新状态</button></div></div>
-</div>
-<div><h2>环境</h2><div class="secret-grid">
-<div class="secret"><span>GitHub</span><span id="secretGithub">${configuredLabel(status.secrets.github)}</span></div>
-<div class="secret"><span>Webhook</span><span id="secretWebhook">${configuredLabel(status.secrets.webhook)}</span></div>
-<div class="secret"><span>Webhook 鉴权</span><span id="secretWebhookAuth">${configuredLabel(status.secrets.webhookAuth)}</span></div>
-<div class="secret"><span>管理员</span><span id="secretAdmin">${configuredLabel(status.secrets.admin)}</span></div>
-</div><p class="stamp">上游：<span id="upstreamRepo">${escapeHtml(status.config.upstreamRepo)}</span><br>预检修订：<code id="patchRevision">${escapeHtml(status.RP_HUB_APP_PATCH_REVISION)}</code></p></div>
-</section>
-<section class="band"><h2>已发布版本</h2><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit</th><th>发布时间</th><th>文件数</th><th>操作</th></tr></thead><tbody id="versionsBody">${versionRows(status.manifest.versions)}</tbody></table></div><div id="announcementPanel" class="notice" style="display:none;margin-top:12px"></div></section>
-<section class="band"><h2>Pending</h2><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit</th><th>原因</th><th>详情</th><th>发现时间</th><th>操作</th></tr></thead><tbody id="pendingBody">${pendingRows(status.manifest.pending)}</tbody></table></div></section>
-<section class="band"><h2>插件投稿</h2><p class="stamp">投稿页：<a href="/workshop/submit">/workshop/submit</a>。先点「查看代码」审阅再上架；同一 id 上架会覆盖旧版本。</p><div class="row"><button id="workshopRefresh" class="secondary">刷新工坊</button></div><div class="table-wrap"><table><thead><tr><th>插件</th><th>版本</th><th>作者</th><th>说明 / 联系</th><th>投稿时间</th><th>操作</th></tr></thead><tbody id="workshopPendingBody"><tr><td colspan="6" class="empty">保存管理员令牌后点「刷新工坊」</td></tr></tbody></table></div><pre id="workshopSource" class="notice" style="display:none;max-height:420px;overflow:auto;white-space:pre-wrap"></pre></section>
-<section class="band"><h2>已上架插件</h2><div class="table-wrap"><table><thead><tr><th>插件</th><th>版本</th><th>作者</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="workshopPluginsBody"></tbody></table></div></section>
+${main}
 </main>
-<script>
-const byId=(id)=>document.getElementById(id);const esc=(value)=>String(value??'').replace(/[&<>"']/g,(character)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));const time=(value)=>{if(!(Number(value)>0))return '尚无记录';const parts=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(Number(value)));const get=(type)=>parts.find((part)=>part.type===type)?.value||'';return get('year')+'-'+get('month')+'-'+get('day')+' '+get('hour')+':'+get('minute')+':'+get('second')+' (UTC+8)'};const configured=(value)=>value?'<span class="configured">已配置</span>':'<span class="missing">未配置</span>';const notice=(message,type='')=>{byId('notice').textContent=message;byId('notice').className='notice '+type};const storedToken=()=>localStorage.getItem('mirrorAdminToken')||'';byId('adminToken').value=storedToken();
-async function api(path,options={}){const headers=new Headers(options.headers||{});const token=storedToken();if(token)headers.set('authorization','Bearer '+token);if(options.body)headers.set('content-type','application/json');const response=await fetch(path,{...options,headers});let value;try{value=await response.json()}catch{value={ok:false,error:'响应不是有效 JSON。'}}if(!response.ok)throw new Error(value.error||('HTTP '+response.status));return value}
-function bindRetry(){document.querySelectorAll('.retry').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;notice('正在重试 '+button.dataset.tag+'…');try{const result=await api('/api/pending/retry',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice(result.sync?.ok?'重试完成。':'重试已执行，同步仍有错误。',result.sync?.ok?'ok':'error');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}}))}
-function bindDelete(){document.querySelectorAll('.delete-version').forEach((button)=>button.addEventListener('click',async()=>{if(!confirm('确认删除版本 '+button.dataset.tag+'？其快照文件将一并清理；若它仍是上游现行 Release，下次同步会重新上架。'))return;button.disabled=true;notice('正在删除 '+button.dataset.tag+'…');try{const result=await api('/api/versions/delete',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice('已删除 '+button.dataset.tag+'（清理快照 '+(result.snapshotsDeleted||0)+' 个）。','ok');await refresh()}catch(error){notice(error.message,'error');button.disabled=false}}))}
-function bindAnnouncements(){document.querySelectorAll('.show-announcement').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;const panel=byId('announcementPanel');panel.textContent='公告加载中…';panel.style.display='';try{const response=await fetch('/announcements.json?tag='+encodeURIComponent(button.dataset.tag));let value=null;try{value=await response.json()}catch{value=null}panel.textContent='';const head=document.createElement('b');head.textContent='公告 · '+button.dataset.tag;panel.appendChild(head);panel.appendChild(document.createElement('br'));if(!response.ok||!value){panel.appendChild(document.createTextNode(response.status===404?'公告索引尚未生成，请先在管理端点一次「立即同步」。':'公告加载失败：HTTP '+response.status))}else{const entry=(Array.isArray(value.entries)?value.entries:[]).find((item)=>item&&item.tag===button.dataset.tag)||null;if(!entry||!entry.announcement){panel.appendChild(document.createTextNode('该版本暂无公告'+(entry&&entry.reason?'（'+entry.reason+'）。':'。')))}else{const info=document.createElement('span');info.textContent='[ID '+entry.announcement.id+'] '+entry.announcement.title;panel.appendChild(info);panel.appendChild(document.createElement('br'));const pre=document.createElement('pre');pre.textContent=entry.announcement.content;panel.appendChild(pre)}}}catch(error){panel.textContent='公告加载失败：'+error.message;panel.style.display=''}finally{button.disabled=false}}))}
-function render(status){byId('pageStamp').textContent=time(Date.now());byId('manifestState').textContent=status.manifest.valid?'正常':'格式无效';byId('updatedAt').textContent=time(status.manifest.updatedAt);byId('counts').textContent=status.manifest.versions.length+' / '+status.manifest.pending.length;byId('syncError').textContent=status.syncError?((status.syncError.valid?'存在同步错误':'错误状态格式无效')+' · '+time(status.syncError.at)):'无同步错误';const detailBox=byId('syncErrorDetail');const detailText=status.syncError&&status.syncError.detail?((status.syncError.tag?'['+status.syncError.tag+'] ':'')+status.syncError.detail):'';detailBox.textContent=detailText;detailBox.style.display=detailText?'':'none';const progress=status.syncProgress;const progressBox=byId('syncProgress');progressBox.textContent='同步进度：'+(progress?((progress.state==='running'?'进行中':(progress.state==='done'?'已完成':'出错'))+' · 第 '+progress.step+' 步：'+progress.phase+(progress.detail?' — '+progress.detail:'')+' · '+time(progress.at)):'尚未同步过');progressBox.className='notice '+(progress?(progress.state==='running'?'':(progress.state==='done'?'ok':'error')):'');byId('releaseLimit').value=status.config.releaseLimit;byId('webhookEnabled').checked=status.config.webhookEnabled;byId('upstreamRepo').textContent=status.config.upstreamRepo;byId('patchRevision').textContent=status.RP_HUB_APP_PATCH_REVISION;byId('secretGithub').innerHTML=configured(status.secrets.github);byId('secretWebhook').innerHTML=configured(status.secrets.webhook);byId('secretWebhookAuth').innerHTML=configured(status.secrets.webhookAuth);byId('secretAdmin').innerHTML=configured(status.secrets.admin);byId('versionsBody').innerHTML=status.manifest.versions.length?status.manifest.versions.map((item)=>'<tr><td>'+esc(item.tag)+'</td><td><code>'+esc(item.commit)+'</code></td><td>'+esc(time(item.publishedAt))+'</td><td>'+Number(item.fileCount||0)+'</td><td><button class="secondary show-announcement" data-tag="'+esc(item.tag)+'">公告</button> <button class="secondary delete-version" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">删除</button></td></tr>').join(''):'<tr><td colspan="5" class="empty">尚无已发布版本</td></tr>';byId('pendingBody').innerHTML=status.manifest.pending.length?status.manifest.pending.map((item)=>'<tr><td>'+esc(item.tag)+'</td><td><code>'+esc(item.commit)+'</code></td><td>'+esc(item.reason)+'</td><td class="detail">'+esc(item.detail)+'</td><td>'+esc(time(item.seenAt))+'</td><td><button class="secondary retry" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">重试</button></td></tr>').join(''):'<tr><td colspan="6" class="empty">当前没有 pending</td></tr>';bindRetry();bindDelete();byId('announcementPanel').style.display='none';bindAnnouncements()}
-let progressTimer=null;function startProgressPolling(){if(progressTimer)return;progressTimer=setInterval(async()=>{try{const status=await api('/api/status');render(status);if(!status.syncProgress||status.syncProgress.state!=='running'){clearInterval(progressTimer);progressTimer=null}}catch{}},2000)}
-function syncSummary(result){const parts=[];const published=(result.events||[]).filter((event)=>event==='version_published'||event==='retag_republished').length;const failed=(result.events||[]).filter((event)=>event.indexOf('precheck_failed')>=0).length;if(published)parts.push('本轮上架 '+published+' 个版本');if(failed)parts.push(failed+' 个预检失败转 pending');if(!published&&!failed)parts.push(result.changed?'状态已更新':'无新版本');parts.push('累计已发布 '+result.versionCount+' 个');if(result.snapshotBudget&&result.snapshotBudget.deferred)parts.push('还有版本待回填，请再点一次「立即同步」');return parts.join('；')+'。'}
-async function refresh(){try{render(await api('/api/status'));notice('状态已刷新。','ok')}catch(error){notice(error.message,'error')}}
-byId('saveToken').addEventListener('click',()=>{localStorage.setItem('mirrorAdminToken',byId('adminToken').value.trim());notice('管理员令牌已保存到此浏览器。','ok')});byId('refresh').addEventListener('click',refresh);byId('syncNow').addEventListener('click',async(event)=>{event.currentTarget.disabled=true;notice('正在同步…（下方进度条每 2 秒自动刷新）');startProgressPolling();try{const result=await api('/api/sync',{method:'POST'});notice(result.ok?'同步完成：'+syncSummary(result):'同步失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refresh()}catch(error){notice('同步失败：'+error.message,'error')}finally{event.currentTarget.disabled=false}});byId('webhookTest').addEventListener('click',async(event)=>{event.currentTarget.disabled=true;notice('正在测试 Webhook…');try{const result=await api('/api/webhook-test',{method:'POST'});notice(result.sent?'Webhook 已发送。':(result.disabled?'Webhook 已禁用。':'Webhook 未发送。'),result.sent?'ok':'error')}catch(error){notice(error.message,'error')}finally{event.currentTarget.disabled=false}});byId('configForm').addEventListener('submit',async(event)=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{const config=await api('/api/config',{method:'PUT',body:JSON.stringify({releaseLimit:Number(byId('releaseLimit').value),webhookEnabled:byId('webhookEnabled').checked})});notice('配置已保存。','ok');byId('releaseLimit').value=config.config.releaseLimit}catch(error){notice(error.message,'error')}finally{button.disabled=false}});bindRetry();bindDelete();bindAnnouncements();
-async function refreshWorkshop(){try{const value=await api('/api/workshop/pending');byId('workshopPendingBody').innerHTML=value.pending.length?value.pending.map((item)=>{const current=value.plugins.find((plugin)=>plugin.id===item.id);return '<tr><td>'+esc(item.name)+'<br><code>'+esc(item.id)+'</code></td><td>'+esc(item.version)+'<br><span class="stamp">'+(current?'现为 '+esc(current.version)+'（'+esc(current.author)+'）':'新插件')+'</span></td><td>'+esc(item.author)+'</td><td class="detail">'+esc(item.description)+(item.contact?'<br>联系：'+esc(item.contact):'')+'</td><td>'+esc(time(item.submittedAt))+'</td><td><button class="secondary ws-view" data-sid="'+esc(item.sid)+'">查看代码</button> <button class="ws-approve" data-sid="'+esc(item.sid)+'">上架</button> <button class="secondary ws-reject" data-sid="'+esc(item.sid)+'">拒绝</button></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">没有待审核的投稿</td></tr>';byId('workshopPluginsBody').innerHTML=value.plugins.length?value.plugins.map((plugin)=>'<tr><td>'+esc(plugin.name)+'<br><code>'+esc(plugin.id)+'</code></td><td>'+esc(plugin.version)+'</td><td>'+esc(plugin.author)+'</td><td>'+esc(time(plugin.updatedAt))+'</td><td><a href="'+esc(plugin.file.path)+'" target="_blank" rel="noopener">源码</a> <button class="secondary ws-remove" data-id="'+esc(plugin.id)+'">下架</button></td></tr>').join(''):'<tr><td colspan="5" class="empty">工坊暂无插件</td></tr>';bindWorkshop();notice('工坊已刷新。','ok')}catch(error){notice(error.message,'error')}}
-function bindWorkshop(){const act=(selector,handler)=>document.querySelectorAll(selector).forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;try{await handler(button.dataset)}catch(error){notice(error.message,'error')}finally{button.disabled=false}}));act('.ws-view',async({sid})=>{const response=await fetch('/api/workshop/pending/'+sid+'.js',{headers:{authorization:'Bearer '+storedToken()}});if(!response.ok)throw new Error('HTTP '+response.status);const box=byId('workshopSource');box.textContent=await response.text();box.style.display='';box.scrollIntoView({block:'nearest'})});act('.ws-approve',async({sid})=>{if(!confirm('确认上架？插件会拥有安装它的站点的全部权限。'))return;const result=await api('/api/workshop/approve',{method:'POST',body:JSON.stringify({sid})});await refreshWorkshop();notice('已上架 '+result.published.id+' v'+result.published.version+'。','ok')});act('.ws-reject',async({sid})=>{if(!confirm('确认拒绝这条投稿？'))return;await api('/api/workshop/reject',{method:'POST',body:JSON.stringify({sid})});await refreshWorkshop()});act('.ws-remove',async({id})=>{if(!confirm('确认下架 '+id+'？已经装了的站点不受影响，但工坊里不再显示。'))return;await api('/api/workshop/remove',{method:'POST',body:JSON.stringify({id})});await refreshWorkshop()})}
-byId('workshopRefresh').addEventListener('click',refreshWorkshop);if(storedToken())refreshWorkshop();
-</script>
+<footer class="wrap footer">公开数据：<code>/manifest.json</code> · <code>/test-releases/manifest.json</code> · <code>/workshop/index.json</code></footer>
+${script ? `<script>${script}</script>` : ''}
 </body>
 </html>`;
+}
+
+// 管理页：概览、上游版本、测试版、插件审核、设置。数据都从现有接口读取，写操作带管理员令牌。
+const ADMIN_SCRIPT = String.raw`
+const byId=(id)=>document.getElementById(id);const esc=(value)=>String(value??'').replace(/[&<>"']/g,(character)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));const time=(value)=>{if(!(Number(value)>0))return '尚无记录';const parts=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(Number(value)));const get=(type)=>parts.find((part)=>part.type===type)?.value||'';return get('year')+'-'+get('month')+'-'+get('day')+' '+get('hour')+':'+get('minute')};const kb=(bytes)=>Math.max(1,Math.round(Number(bytes||0)/1024))+' KB';
+const configured=(value)=>value?'<span class="badge ok">已配置</span>':'<span class="badge danger">未配置</span>';const notice=(message,type)=>{const box=byId('notice');box.textContent=message;box.className='notice '+(type||'')};const storedToken=()=>localStorage.getItem('mirrorAdminToken')||'';
+async function api(path,options={}){const headers=new Headers(options.headers||{});const token=storedToken();if(token)headers.set('authorization','Bearer '+token);if(options.body)headers.set('content-type','application/json');const response=await fetch(path,{...options,headers});let value;try{value=await response.json()}catch{value={ok:false,error:'响应不是有效 JSON。'}}if(!response.ok)throw new Error(value.error||('HTTP '+response.status));return value}
+function renderAuth(){const signedIn=Boolean(storedToken());byId('authForm').hidden=signedIn;byId('authState').hidden=!signedIn}
+byId('authForm').addEventListener('submit',(event)=>{event.preventDefault();const token=byId('adminToken').value.trim();if(!token)return;localStorage.setItem('mirrorAdminToken',token);byId('adminToken').value='';renderAuth();notice('管理员令牌已保存到此浏览器。','ok');refreshWorkshop()});
+byId('logout').addEventListener('click',()=>{localStorage.removeItem('mirrorAdminToken');renderAuth();notice('已退出，令牌已从此浏览器删除。')});
+function showTab(name){if(!document.querySelector('[data-panel="'+name+'"]'))name='overview';document.querySelectorAll('[data-tab]').forEach((button)=>button.setAttribute('aria-selected',String(button.dataset.tab===name)));document.querySelectorAll('[data-panel]').forEach((panel)=>{panel.hidden=panel.dataset.panel!==name});history.replaceState(null,'','#'+name);if(name==='tests')refreshTests();if(name==='workshop')refreshWorkshop()}
+document.querySelectorAll('[data-tab]').forEach((button)=>button.addEventListener('click',()=>showTab(button.dataset.tab)));window.addEventListener('hashchange',()=>showTab(location.hash.slice(1)));
+function versionItems(versions){return versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>commit <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>收录 '+esc(time(item.publishedAt))+'</span><span>'+Number(item.fileCount||0)+' 个文件</span></div></div><div class="actions"><button class="btn small show-announcement" data-tag="'+esc(item.tag)+'">公告</button><button class="btn small danger delete-version" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">删除</button></div></li>').join(''):'<li class="empty">尚无已发布版本</li>'}
+function pendingItems(pending){return pending.length?pending.map((item)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> <span class="badge warn">'+esc(item.reason)+'</span><div class="meta"><span>commit <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>发现 '+esc(time(item.seenAt))+'</span></div><div class="notes small muted">'+esc(item.detail)+'</div></div><button class="btn small retry" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">重试</button></li>').join(''):'<li class="empty">没有挂起的版本</li>'}
+function bindRetry(){document.querySelectorAll('.retry').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;notice('正在重试 '+button.dataset.tag+'…');try{const result=await api('/api/pending/retry',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice(result.sync?.ok?'重试完成。':'重试已执行，同步仍有错误。',result.sync?.ok?'ok':'error');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}}))}
+function bindDelete(){document.querySelectorAll('.delete-version').forEach((button)=>button.addEventListener('click',async()=>{if(!confirm('确认删除版本 '+button.dataset.tag+'？快照文件一并清理；如果它仍是上游现行 Release，下次同步会重新上架。'))return;button.disabled=true;notice('正在删除 '+button.dataset.tag+'…');try{const result=await api('/api/versions/delete',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice('已删除 '+button.dataset.tag+'（清理快照 '+(result.snapshotsDeleted||0)+' 个）。','ok');await refresh()}catch(error){notice(error.message,'error');button.disabled=false}}))}
+function bindAnnouncements(){document.querySelectorAll('.show-announcement').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;const panel=byId('announcementPanel');panel.textContent='公告加载中…';panel.hidden=false;try{const response=await fetch('/announcements.json?tag='+encodeURIComponent(button.dataset.tag));let value=null;try{value=await response.json()}catch{value=null}panel.textContent='';const head=document.createElement('h3');head.textContent='公告 · '+button.dataset.tag;panel.appendChild(head);if(!response.ok||!value){const message=document.createElement('p');message.textContent=response.status===404?'公告索引尚未生成，请先点一次「立即同步」。':'公告加载失败：HTTP '+response.status;panel.appendChild(message)}else{const entry=(Array.isArray(value.entries)?value.entries:[]).find((item)=>item&&item.tag===button.dataset.tag)||null;const body=document.createElement(entry&&entry.announcement?'pre':'p');body.textContent=entry&&entry.announcement?'[ID '+entry.announcement.id+'] '+entry.announcement.title+'\n\n'+entry.announcement.content:'该版本暂无公告'+(entry&&entry.reason?'（'+entry.reason+'）。':'。');panel.appendChild(body)}panel.scrollIntoView({block:'nearest'})}catch(error){panel.textContent='公告加载失败：'+error.message}finally{button.disabled=false}}))}
+function render(status){byId('pageStamp').textContent='状态时间 '+time(Date.now());byId('manifestState').textContent=status.manifest.valid?'正常':'格式无效';byId('updatedAt').textContent=time(status.manifest.updatedAt);byId('counts').textContent=status.manifest.versions.length+' / '+status.manifest.pending.length;const error=status.syncError;byId('syncError').textContent=error?((error.valid?'有同步错误':'错误状态无效')+' · '+time(error.at)):'无';const detail=error&&error.detail?((error.tag?'['+error.tag+'] ':'')+error.detail):'';byId('syncErrorDetail').textContent=detail;byId('syncErrorDetail').hidden=!detail;const progress=status.syncProgress;const box=byId('syncProgress');box.textContent='同步进度：'+(progress?((progress.state==='running'?'进行中':(progress.state==='done'?'已完成':'出错'))+' · 第 '+progress.step+' 步：'+progress.phase+(progress.detail?' — '+progress.detail:'')+' · '+time(progress.at)):'尚未同步过');box.className='notice '+(progress?(progress.state==='running'?'':(progress.state==='done'?'ok':'error')):'');byId('releaseLimit').value=status.config.releaseLimit;byId('webhookEnabled').checked=status.config.webhookEnabled;byId('upstreamRepo').textContent=status.config.upstreamRepo;byId('patchRevision').textContent=status.RP_HUB_APP_PATCH_REVISION;byId('secretGithub').innerHTML=configured(status.secrets.github);byId('secretWebhook').innerHTML=configured(status.secrets.webhook);byId('secretWebhookAuth').innerHTML=configured(status.secrets.webhookAuth);byId('secretAdmin').innerHTML=configured(status.secrets.admin);byId('versionsBody').innerHTML=versionItems(status.manifest.versions);byId('pendingBody').innerHTML=pendingItems(status.manifest.pending);byId('pendingCount').textContent=status.manifest.pending.length?String(status.manifest.pending.length):'';bindRetry();bindDelete();byId('announcementPanel').hidden=true;bindAnnouncements()}
+let progressTimer=null;function startProgressPolling(){if(progressTimer)return;progressTimer=setInterval(async()=>{try{const status=await api('/api/status');render(status);if(!status.syncProgress||status.syncProgress.state!=='running'){clearInterval(progressTimer);progressTimer=null}}catch{}},2000)}
+function syncSummary(result){const parts=[];const published=(result.events||[]).filter((event)=>event==='version_published'||event==='retag_republished').length;const failed=(result.events||[]).filter((event)=>event.indexOf('precheck_failed')>=0).length;if(published)parts.push('上架 '+published+' 个上游版本');if(failed)parts.push(failed+' 个预检失败转挂起');if(!published&&!failed)parts.push(result.changed?'状态已更新':'上游无新版本');parts.push('累计 '+result.versionCount+' 个');if(result.snapshotBudget&&result.snapshotBudget.deferred)parts.push('还有版本待回填，请再点一次「立即同步」');if(result.testReleases)parts.push(result.testReleases.ok?'测试版 '+result.testReleases.versionCount+' 个':'测试版同步失败：'+result.testReleases.error);return parts.join('；')+'。'}
+async function refresh(){try{render(await api('/api/status'))}catch(error){notice(error.message,'error')}}
+byId('refresh').addEventListener('click',async()=>{await refresh();notice('状态已刷新。','ok')});
+byId('syncNow').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('正在同步…（进度每 2 秒刷新）');startProgressPolling();try{const result=await api('/api/sync',{method:'POST'});notice(result.ok?'同步完成：'+syncSummary(result):'同步失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refresh();refreshTests()}catch(error){notice('同步失败：'+error.message,'error')}finally{button.disabled=false}});
+byId('webhookTest').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('正在测试 Webhook…');try{const result=await api('/api/webhook-test',{method:'POST'});notice(result.sent?'Webhook 已发送。':(result.disabled?'Webhook 已禁用。':'Webhook 未发送。'),result.sent?'ok':'error')}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
+byId('configForm').addEventListener('submit',async(event)=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{await api('/api/config',{method:'PUT',body:JSON.stringify({releaseLimit:Number(byId('releaseLimit').value),webhookEnabled:byId('webhookEnabled').checked})});notice('配置已保存。','ok');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
+async function refreshTests(){const box=byId('testsBody');try{const response=await fetch('/test-releases/manifest.json',{cache:'no-store'});if(response.status===404){box.innerHTML='<li class="empty">还没有测试版</li>';return}const value=await response.json();const versions=value.versions||[];box.innerHTML=versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>发布 '+esc(time(item.publishedAt))+'</span><span>发布包 '+kb(item.bundle&&item.bundle.size)+'</span>'+(item.zip?'<span>部署包 '+kb(item.zip.size)+'</span>':'')+'</div><p class="notes small">'+esc(item.notes||'无更新说明')+'</p></div>'+(item.zip?'<a class="btn small" href="'+esc(item.zip.path)+'">部署包</a>':'')+'</li>').join(''):'<li class="empty">还没有测试版</li>'}catch(error){box.innerHTML='<li class="empty">读取失败：'+esc(error.message)+'</li>'}}
+let workshop={pending:[],plugins:[]};let review=null;
+async function refreshWorkshop(){if(!storedToken()){byId('workshopPendingBody').innerHTML='<li class="empty">保存管理员令牌后才能查看投稿</li>';byId('workshopPluginsBody').innerHTML='';return}try{workshop=await api('/api/workshop/pending');renderWorkshop()}catch(error){notice(error.message,'error')}}
+function renderWorkshop(){byId('workshopCount').textContent=workshop.pending.length?String(workshop.pending.length):'';byId('workshopPendingBody').innerHTML=workshop.pending.length?workshop.pending.map((item)=>{const current=workshop.plugins.find((plugin)=>plugin.id===item.id);return '<li><div class="grow"><b>'+esc(item.name)+'</b> <code>'+esc(item.id)+'</code> '+(current?'<span class="badge warn">更新 '+esc(current.version)+' → '+esc(item.version)+'</span>':'<span class="badge ok">新插件 '+esc(item.version)+'</span>')+'<div class="meta"><span>'+esc(item.author)+'</span><span>投稿 '+esc(time(item.submittedAt))+'</span><span>'+kb(item.size)+'</span><span>API '+esc(item.requiresApi)+'</span>'+(item.contact?'<span>联系 '+esc(item.contact)+'</span>':'')+'</div><p class="notes small">'+esc(item.description)+'</p></div><button class="btn small primary ws-review" data-sid="'+esc(item.sid)+'">审阅</button></li>'}).join(''):'<li class="empty">没有待审核的投稿</li>';byId('workshopPluginsBody').innerHTML=workshop.plugins.length?workshop.plugins.map((plugin)=>'<li><div class="grow"><b>'+esc(plugin.name)+'</b> <code>'+esc(plugin.id)+'</code> <span class="badge">v'+esc(plugin.version)+'</span><div class="meta"><span>'+esc(plugin.author)+'</span><span>更新 '+esc(time(plugin.updatedAt))+'</span><span>'+kb(plugin.file&&plugin.file.size)+'</span></div></div><div class="actions"><a class="btn small" href="'+esc(plugin.file.path)+'" target="_blank" rel="noopener">源码</a><button class="btn small danger ws-remove" data-id="'+esc(plugin.id)+'">下架</button></div></li>').join(''):'<li class="empty">工坊里还没有插件</li>';document.querySelectorAll('.ws-review').forEach((button)=>button.addEventListener('click',()=>openReview(button.dataset.sid).catch((error)=>notice(error.message,'error'))));document.querySelectorAll('.ws-remove').forEach((button)=>button.addEventListener('click',async()=>{if(!confirm('确认下架 '+button.dataset.id+'？已经装了的站点不受影响，但工坊里不再显示。'))return;button.disabled=true;try{await api('/api/workshop/remove',{method:'POST',body:JSON.stringify({id:button.dataset.id})});notice('已下架 '+button.dataset.id+'。','ok');await refreshWorkshop()}catch(error){notice(error.message,'error');button.disabled=false}}))}
+async function openReview(sid){const item=workshop.pending.find((entry)=>entry.sid===sid);if(!item)return;const current=workshop.plugins.find((plugin)=>plugin.id===item.id)||null;notice('正在读取投稿代码…');const response=await fetch('/api/workshop/pending/'+sid+'.js',{headers:{authorization:'Bearer '+storedToken()}});if(!response.ok)throw new Error('读取投稿代码失败：HTTP '+response.status);const text=await response.text();let old=null;if(current){const published=await fetch(current.file.path,{cache:'no-store'});if(published.ok)old=await published.text()}review={item,current,text,old};byId('reviewTitle').textContent=item.name+' · '+item.id+' v'+item.version;byId('reviewMeta').innerHTML='<span>作者 '+esc(item.author)+'</span><span>'+kb(item.size)+'</span><span>API '+esc(item.requiresApi)+'</span><span>SHA-256 <code>'+esc(String(item.sha256).slice(0,16))+'…</code></span>'+(item.contact?'<span>联系 '+esc(item.contact)+'</span>':'')+(current?'<span>当前上架 v'+esc(current.version)+'（'+esc(current.author)+'）</span>':'<span>新插件</span>');byId('reviewDescription').textContent=item.description;byId('viewDiff').hidden=!old;showCode(old?'diff':'full');byId('reviewPanel').hidden=false;byId('reviewPanel').scrollIntoView({block:'start'});notice('请读完代码再决定上架或拒绝。')}
+function showCode(mode){byId('viewDiff').setAttribute('aria-selected',String(mode==='diff'));byId('viewFull').setAttribute('aria-selected',String(mode==='full'));byId('reviewCode').innerHTML=mode==='diff'?renderDiff(review.old,review.text):renderFull(review.text)}
+byId('viewDiff').addEventListener('click',()=>showCode('diff'));byId('viewFull').addEventListener('click',()=>showCode('full'));
+function renderFull(text){return text.split('\n').map((line,index)=>'<div class="ln"><span>'+(index+1)+'</span><code>'+esc(line)+'</code></div>').join('')}
+function diffLines(a,b){let start=0;while(start<a.length&&start<b.length&&a[start]===b[start])start++;let endA=a.length,endB=b.length;while(endA>start&&endB>start&&a[endA-1]===b[endB-1]){endA--;endB--}const ops=[];for(let i=0;i<start;i++)ops.push(['=',a[i],i+1,i+1]);const x=a.slice(start,endA),y=b.slice(start,endB);if(x.length*y.length<=4000000){const n=x.length,m=y.length,w=m+1,dp=new Uint32Array((n+1)*w);for(let i=n-1;i>=0;i--)for(let j=m-1;j>=0;j--)dp[i*w+j]=x[i]===y[j]?dp[(i+1)*w+j+1]+1:Math.max(dp[(i+1)*w+j],dp[i*w+j+1]);let i=0,j=0;while(i<n||j<m){if(i<n&&j<m&&x[i]===y[j]){ops.push(['=',x[i],start+i+1,start+j+1]);i++;j++}else if(j<m&&(i>=n||dp[i*w+j+1]>dp[(i+1)*w+j])){ops.push(['+',y[j],0,start+j+1]);j++}else{ops.push(['-',x[i],start+i+1,0]);i++}}}else{x.forEach((line,k)=>ops.push(['-',line,start+k+1,0]));y.forEach((line,k)=>ops.push(['+',line,0,start+k+1]))}for(let k=0;k<a.length-endA;k++)ops.push(['=',a[endA+k],endA+k+1,endB+k+1]);return ops}
+function renderDiff(oldText,newText){const ops=diffLines(oldText.split('\n'),newText.split('\n'));const keep=new Uint8Array(ops.length);let added=0,removed=0;ops.forEach((op,index)=>{if(op[0]==='+')added++;if(op[0]==='-')removed++;if(op[0]!=='=')for(let d=-3;d<=3;d++)if(index+d>=0&&index+d<ops.length)keep[index+d]=1});if(!added&&!removed)return '<div class="empty">代码和已上架版本完全相同</div>';let html='<div class="diff-sum"><span class="badge ok">+'+added+' 行</span> <span class="badge danger">-'+removed+' 行</span> <span class="muted small">只显示改动和前后 3 行</span></div>',skipped=0;const gap=()=>{if(skipped)html+='<div class="ln gap"><span></span><code>… 省略 '+skipped+' 行未改动 …</code></div>';skipped=0};ops.forEach((op,index)=>{if(!keep[index]){skipped++;return}gap();html+='<div class="ln'+(op[0]==='+'?' add':op[0]==='-'?' del':'')+'"><span>'+(op[0]==='-'?op[2]:op[3])+'</span><code>'+(op[0]==='='?' ':op[0])+' '+esc(op[1])+'</code></div>'});gap();return html}
+async function decide(action){if(!review)return;const label=action==='approve'?'上架':'拒绝';if(!confirm(action==='approve'?'确认上架？插件会拥有安装它的站点的全部权限。':'确认拒绝这条投稿？投稿文件会被删除。'))return;try{const result=await api('/api/workshop/'+action,{method:'POST',body:JSON.stringify({sid:review.item.sid})});byId('reviewPanel').hidden=true;review=null;await refreshWorkshop();notice(action==='approve'?'已上架 '+result.published.id+' v'+result.published.version+'。':'已'+label+'。','ok')}catch(error){notice(label+'失败：'+error.message,'error')}}
+byId('reviewApprove').addEventListener('click',()=>decide('approve'));byId('reviewReject').addEventListener('click',()=>decide('reject'));byId('reviewClose').addEventListener('click',()=>{byId('reviewPanel').hidden=true});byId('workshopRefresh').addEventListener('click',async()=>{await refreshWorkshop();notice('工坊已刷新。','ok')});
+renderAuth();refresh();showTab(location.hash.slice(1)||'overview');if(storedToken())refreshWorkshop();
+`;
+
+const ADMIN_CSS = '.admin-head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px 20px;margin-bottom:16px}.auth{display:flex;gap:8px;align-items:center}.auth input{width:240px}.tabs{display:flex;gap:4px;margin:18px 0 16px;border-bottom:1px solid var(--line);overflow-x:auto}.tabs button{position:relative;padding:9px 14px;border:0;border-bottom:2px solid transparent;background:none;color:var(--muted);font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}.tabs button[aria-selected=true]{color:var(--primary-text);border-bottom-color:var(--primary)}.tabs .count:not(:empty){margin-left:6px;padding:0 7px;border-radius:999px;background:var(--danger);color:#fff;font-size:12px}.panel-grid{display:grid;gap:16px}.panel-grid h2{margin-bottom:10px}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.kv{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line)}.kv:first-of-type{border-top:0}.inline-form{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.inline-form input[type=number]{width:90px}#announcementPanel h3{margin-bottom:8px}#announcementPanel pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.review-head{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px}.code-tabs{display:flex;gap:6px;margin:12px 0 8px}.code-tabs button[aria-selected=true]{border-color:var(--primary);color:var(--primary-text)}.code{max-height:560px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--surface-2)}.ln{display:grid;grid-template-columns:52px minmax(0,1fr);font:12.5px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.ln span{padding:0 8px;text-align:right;color:var(--muted);user-select:none;border-right:1px solid var(--line)}.ln code{padding:0 10px;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.ln.add{background:var(--ok-soft)}.ln.del{background:var(--danger-soft)}.ln.gap code{color:var(--muted);font-style:italic}.diff-sum{display:flex;gap:6px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line)}@media(max-width:640px){.auth{width:100%}.auth input{flex:1;width:auto}}';
+
+function renderConsoleHtml() {
+    const main = `<div class="admin-head">
+<div><h1>管理</h1><p id="pageStamp" class="lead small"></p></div>
+<div class="auth"><form id="authForm" class="auth"><input id="adminToken" type="password" autocomplete="off" placeholder="管理员令牌" aria-label="管理员令牌"><button class="btn primary" type="submit">保存令牌</button></form><div id="authState" class="auth" hidden><span class="badge ok">已保存令牌</span><button id="logout" class="btn small" type="button">退出</button></div></div>
+</div>
+<div id="notice" class="notice">就绪</div>
+<div class="tabs" role="tablist">
+<button type="button" role="tab" data-tab="overview">概览</button>
+<button type="button" role="tab" data-tab="upstream">上游版本<span id="pendingCount" class="count"></span></button>
+<button type="button" role="tab" data-tab="tests">测试版</button>
+<button type="button" role="tab" data-tab="workshop">插件审核<span id="workshopCount" class="count"></span></button>
+<button type="button" role="tab" data-tab="settings">设置</button>
+</div>
+<section data-panel="overview" class="panel-grid">
+<div class="metrics">
+<div class="stat"><span>清单状态</span><b id="manifestState">—</b></div>
+<div class="stat"><span>最后更新</span><b id="updatedAt">—</b></div>
+<div class="stat"><span>上游已发布 / 挂起</span><b id="counts">—</b></div>
+<div class="stat"><span>同步错误</span><b id="syncError">—</b></div>
+</div>
+<div id="syncProgress" class="notice">同步进度：读取中…</div>
+<div id="syncErrorDetail" class="notice error" hidden></div>
+<div class="actions"><button id="syncNow" class="btn primary" type="button">立即同步</button><button id="refresh" class="btn" type="button">刷新状态</button></div>
+<p class="muted small">「立即同步」会同时同步上游版本和测试版；插件工坊不需要同步，审核上架后立即生效。</p>
+</section>
+<section data-panel="upstream" class="panel-grid" hidden>
+<div><h2>已发布版本</h2><ul id="versionsBody" class="list card"></ul></div>
+<div id="announcementPanel" class="card pad" hidden></div>
+<div><h2>挂起的版本</h2><ul id="pendingBody" class="list card"></ul></div>
+</section>
+<section data-panel="tests" class="panel-grid" hidden>
+<div><h2>测试版</h2><p class="muted small">来自 GitHub 上的日期标签 Release，随「立即同步」更新。</p><ul id="testsBody" class="list card"><li class="empty">读取中…</li></ul></div>
+</section>
+<section data-panel="workshop" class="panel-grid" hidden>
+<div class="block-head" style="margin:0"><div><h2>待审核投稿</h2><p class="muted small">投稿页：<a href="/workshop/submit">/workshop/submit</a>。同一 id 上架会覆盖旧版本。</p></div><button id="workshopRefresh" class="btn" type="button">刷新</button></div>
+<ul id="workshopPendingBody" class="list card"></ul>
+<div id="reviewPanel" class="card pad" hidden>
+<div class="review-head"><div><h2 id="reviewTitle"></h2><div id="reviewMeta" class="meta"></div></div><button id="reviewClose" class="btn small" type="button">关闭</button></div>
+<p id="reviewDescription" class="notes"></p>
+<div class="code-tabs"><button id="viewDiff" class="btn small" type="button">和已上架版本对比</button><button id="viewFull" class="btn small" type="button">完整代码</button></div>
+<div id="reviewCode" class="code"></div>
+<div class="actions" style="margin-top:12px"><button id="reviewApprove" class="btn primary" type="button">上架</button><button id="reviewReject" class="btn danger" type="button">拒绝</button></div>
+</div>
+<div><h2>已上架插件</h2><ul id="workshopPluginsBody" class="list card"></ul></div>
+</section>
+<section data-panel="settings" class="settings" hidden>
+<div class="card pad"><h2>运行配置</h2><form id="configForm" class="inline-form" style="margin-top:10px"><label for="releaseLimit">保留上游 Release 数</label><input id="releaseLimit" type="number" min="1" max="12" step="1"><label><input id="webhookEnabled" type="checkbox"> 启用 Webhook 通知</label><button class="btn primary" type="submit">保存</button></form><div class="actions" style="margin-top:12px"><button id="webhookTest" class="btn" type="button">测试 Webhook</button></div></div>
+<div class="card pad"><h2>环境</h2><div class="kv"><span>GitHub 令牌</span><span id="secretGithub"></span></div><div class="kv"><span>Webhook 地址</span><span id="secretWebhook"></span></div><div class="kv"><span>Webhook 鉴权</span><span id="secretWebhookAuth"></span></div><div class="kv"><span>管理员令牌</span><span id="secretAdmin"></span></div><div class="kv"><span>上游仓库</span><span id="upstreamRepo"></span></div><div class="kv"><span>补丁修订</span><code id="patchRevision"></code></div></div>
+</section>`;
+    return renderShell({ title: '管理', active: '/admin', main, css: ADMIN_CSS, script: ADMIN_SCRIPT });
 }
 
 function publicPendingReason(reason) {
@@ -2010,9 +2107,19 @@ function publicPendingReason(reason) {
 
 function publicDate(value) {
     const text = String(value || '').trim();
-    return text || '未知';
+    return text ? text.slice(0, 10) : '未知';
 }
 
+// 公开页的时间精确到分钟，不带时区后缀（页面说明里统一注明 UTC+8）。
+function formatShortTime(value) {
+    return formatStatusTime(value).replace(/:\d{2} \(UTC\+8\)$/, '');
+}
+
+function formatKilobytes(bytes) {
+    return `${Math.max(1, Math.round(Number(bytes || 0) / 1024))} KB`;
+}
+
+// 公告展开不依赖 JavaScript：通过 /?tag=…#announcement 在服务端渲染，读取失败时给出重试表单。
 async function publicAnnouncement(env, url) {
     const tag = url.searchParams.get('tag');
     if (tag === null) return '';
@@ -2024,74 +2131,80 @@ async function publicAnnouncement(env, url) {
         const entry = value.entries?.find((item) => item?.tag === tag);
         body = entry?.announcement
             ? `<h3>${escapeHtml(entry.announcement.title)}</h3><pre>${escapeHtml(entry.announcement.content)}</pre>`
-            : '<p>该版本暂无公告。</p>';
+            : '<p class="muted">该版本暂无公告。</p>';
     } catch {
-        body = `<p>公告暂时无法读取，请稍后重试。</p><form method="get" action="/"><input type="hidden" name="tag" value="${escapeHtml(tag)}"><button type="submit">重试</button></form>`;
+        body = `<p class="notice error">公告暂时无法读取，请稍后重试。</p><form method="get" action="/" class="actions" style="margin:12px 0"><input type="hidden" name="tag" value="${escapeHtml(tag)}"><button class="btn" type="submit">重试</button></form>`;
     }
-    return `<section id="announcement" class="band" aria-labelledby="announcement-title"><h2 id="announcement-title">公告 · ${escapeHtml(tag)}</h2>${body}<a href="/">返回版本列表</a></section>`;
+    return `<section id="announcement" class="card" aria-labelledby="announcement-title"><h2 id="announcement-title">公告 · ${escapeHtml(tag)}</h2>${body}<a class="btn small" href="/">返回版本列表</a></section>`;
 }
 
 function renderPublicHtml(status, announcement = '') {
-    const versions = status.manifest.versions.length
-        ? status.manifest.versions.map((version) => `<tr>
-        <td>${escapeHtml(version.tag)}<br><a class="announcement-link" href="/?tag=${encodeURIComponent(version.tag)}#announcement">查看公告</a></td>
-        <td><code>${escapeHtml(String(version.commit).slice(0, 12))}</code></td>
-        <td>${escapeHtml(publicDate(version.date))}</td>
-        <td>${escapeHtml(formatStatusTime(version.publishedAt))}</td>
-        <td>${Number(version.fileCount) || 0}</td>
-    </tr>`).join('')
-        : '<tr><td colspan="5" class="empty">暂无可更新版本</td></tr>';
+    const versions = status.manifest.versions;
+    const testReleases = status.testReleases || [];
+    const plugins = status.workshopPlugins || [];
+    const latestTest = testReleases[0];
+
+    const versionItem = (version, index) => `<li>
+        <div class="grow"><b>${escapeHtml(version.tag)}</b> ${index === 0 ? '<span class="badge primary">最新</span>' : ''}${isDerivedTag(version.tag) ? ' <span class="badge warn">预览</span>' : ''}
+        <div class="meta"><span>上游发布 ${escapeHtml(publicDate(version.date))}</span><span>收录 ${escapeHtml(formatShortTime(version.publishedAt))}</span></div></div>
+        <a class="btn small" href="/?tag=${encodeURIComponent(version.tag)}#announcement">查看公告</a>
+    </li>`;
+    const versionItems = versions.length ? versions.slice(0, 3).map(versionItem).join('') : '<li class="empty">暂无可更新版本</li>';
+    const olderVersions = versions.length > 3
+        ? `<details class="more"><summary>更早的版本（${versions.length - 3}）</summary><ul class="list">${versions.slice(3).map((version, index) => versionItem(version, index + 3)).join('')}</ul></details>`
+        : '';
     const pending = status.manifest.pending.length
-        ? status.manifest.pending.map((item) => `<tr>
-        <td>${escapeHtml(item.tag)}</td>
-        <td><code>${escapeHtml(String(item.commit).slice(0, 12))}</code></td>
-        <td>${escapeHtml(publicPendingReason(item.reason))}</td>
-        <td>${escapeHtml(formatStatusTime(item.seenAt))}</td>
-    </tr>`).join('')
-        : '<tr><td colspan="4" class="empty">无</td></tr>';
-    const testReleases = status.testReleases?.length
-        ? status.testReleases.map((version) => `<tr>
-        <td>${escapeHtml(version.tag)}</td>
-        <td>${escapeHtml(formatStatusTime(version.publishedAt))}</td>
-        <td class="notes">${escapeHtml(version.notes || '无')}</td>
-        <td><a href="${escapeHtml(version.zip.path)}">下载部署包</a></td>
-    </tr>`).join('')
-        : '<tr><td colspan="4" class="empty">暂无测试版</td></tr>';
-    const workshopPlugins = status.workshopPlugins?.length
-        ? status.workshopPlugins.map((plugin) => `<tr>
-        <td>${escapeHtml(plugin.name)}<br><code>${escapeHtml(plugin.id)}</code></td>
-        <td>${escapeHtml(plugin.version)}</td>
-        <td>${escapeHtml(plugin.author)}</td>
-        <td class="notes">${escapeHtml(plugin.description)}</td>
-        <td><a href="${escapeHtml(plugin.file.path)}">查看源码</a></td>
-    </tr>`).join('')
-        : '<tr><td colspan="5" class="empty">暂无插件</td></tr>';
-    return `<!doctype html>
-<html lang="zh-Hans">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>RP-Hub 镜像状态</title>
-<style>
-a{color:var(--accent)}.announcement-link{display:inline-block;white-space:nowrap;padding:3px 0}#announcement{scroll-margin-top:16px}#announcement pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;margin:12px 0;line-height:1.8}#announcement h3{font-size:16px}#announcement button{font:inherit;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:5px 12px;cursor:pointer}
-:root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d8dde3;--text:#17202a;--muted:#66717d;--accent:#146c43}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:0}header{background:var(--panel);border-bottom:1px solid var(--line)}.wrap{width:min(1080px,calc(100% - 32px));margin:auto}.top{padding:26px 0 22px}h1{font-size:25px;margin:0 0 6px}h2{font-size:17px;margin:0 0 12px}.muted,.stamp{color:var(--muted)}main{padding:24px 0 42px}.meta{display:flex;flex-wrap:wrap;gap:8px 26px;padding:14px 0 20px;border-bottom:1px solid var(--line)}.meta span{overflow-wrap:anywhere}.band{padding:22px 0;border-bottom:1px solid var(--line)}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}table{width:100%;border-collapse:collapse;min-width:720px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{background:#eef1f4;color:#3d4854;font-size:12px}tr:last-child td{border-bottom:0}code{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.notes{white-space:pre-wrap;overflow-wrap:anywhere}.empty{text-align:center;color:var(--muted);padding:24px}footer{padding-top:22px;color:var(--muted);font-size:12px}@media(max-width:800px){.wrap{width:min(100% - 20px,1080px)}h1{font-size:22px}}
-@media(prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#111417;--panel:#191d21;--line:#343b43;--text:#eef1f4;--muted:#a6afb9;--accent:#78d9ac}th{background:#252b31;color:var(--muted)}}
-</style>
-</head>
-<body>
-<header><div class="wrap top"><h1>RP-Hub 镜像状态</h1><div>可更新版本信息</div></div></header>
-<main class="wrap">
-<div class="meta"><span>上游仓库：<b>${escapeHtml(status.upstreamRepo)}</b></span><span>页面生成时间：<b>${escapeHtml(formatStatusTime(Date.now()))}</b></span><span>清单更新时间：<b>${escapeHtml(formatStatusTime(status.manifest.updatedAt))}</b></span></div>
+        ? `<details class="more"><summary>暂不可用的版本（${status.manifest.pending.length}）</summary><ul class="list">${status.manifest.pending.map((item) => `<li>
+        <div class="grow"><b>${escapeHtml(item.tag)}</b> <span class="badge warn">${escapeHtml(publicPendingReason(item.reason))}</span>
+        <div class="meta"><span>发现于 ${escapeHtml(formatShortTime(item.seenAt))}</span></div></div></li>`).join('')}</ul></details>`
+        : '';
+
+    const testItem = (release) => `<div class="grow"><b>${escapeHtml(release.tag)}</b>
+        <div class="meta"><span>发布 ${escapeHtml(formatShortTime(release.publishedAt))}</span>${release.zip ? `<span>部署包 ${formatKilobytes(release.zip.size)}</span>` : ''}</div>
+        <p class="notes">${escapeHtml(release.notes || '无更新说明')}</p></div>
+        ${release.zip ? `<a class="btn small" href="${escapeHtml(release.zip.path)}">下载部署包</a>` : ''}`;
+    const tests = latestTest
+        ? `<div class="card pad"><div class="block-head" style="margin:0"><div class="grow"><b style="font-size:18px">${escapeHtml(latestTest.tag)}</b> <span class="badge primary">最新</span>
+        <div class="meta"><span>发布 ${escapeHtml(formatShortTime(latestTest.publishedAt))}</span>${latestTest.zip ? `<span>部署包 ${formatKilobytes(latestTest.zip.size)}</span>` : ''}</div></div>
+        ${latestTest.zip ? `<a class="btn primary" href="${escapeHtml(latestTest.zip.path)}">下载部署包</a>` : ''}</div>
+        <p class="notes">${escapeHtml(latestTest.notes || '无更新说明')}</p></div>
+        ${testReleases.length > 1 ? `<details class="more"><summary>更早的测试版（${testReleases.length - 1}）</summary><ul class="list">${testReleases.slice(1).map((release) => `<li>${testItem(release)}</li>`).join('')}</ul></details>` : ''}`
+        : '<div class="card empty">暂无测试版</div>';
+
+    const pluginCards = plugins.length
+        ? `<div class="plugins">${plugins.map((plugin) => `<article class="card plugin">
+        <div class="plugin-head"><h3>${escapeHtml(plugin.name)}</h3><span class="badge">v${escapeHtml(plugin.version)}</span></div>
+        <div class="meta"><span>${escapeHtml(plugin.author)}</span><span><code>${escapeHtml(plugin.id)}</code></span><span>需要 API ${Number(plugin.requiresApi) || '?'}</span></div>
+        <p>${escapeHtml(plugin.description)}</p>
+        <div class="meta"><span>更新于 ${escapeHtml(formatShortTime(plugin.updatedAt))}</span><a href="${escapeHtml(plugin.file.path)}">查看源码</a></div>
+    </article>`).join('')}</div>`
+        : '<div class="card empty">工坊里还没有插件。<a href="/workshop/submit">投稿第一个插件</a></div>';
+
+    const main = `<section class="hero">
+<h1>RP-Hub 分发站</h1>
+<p class="lead">为 RP-Hub 测试版站点提供上游页面更新、测试版自更新和插件工坊。站点在「云同步」和「模块管理」里直接使用，这里可以查看可用版本和插件。</p>
+<div class="stats">
+<a class="stat" href="#upstream"><span>上游最新版本</span><b>${escapeHtml(versions[0]?.tag || '—')}</b></a>
+<a class="stat" href="#test-builds"><span>测试版最新版本</span><b>${escapeHtml(latestTest?.tag || '—')}</b></a>
+<a class="stat" href="#workshop"><span>工坊插件</span><b>${plugins.length} 个</b></a>
+</div>
+</section>
 ${announcement}
-<section class="band"><h2>可更新版本</h2><p class="muted">点击“查看公告”可直接获取各版本公告，无需管理员口令。在站点更新页面点击“检测版本”即可获取最新清单。</p><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit（前 12 位）</th><th>上游日期</th><th>上架时间</th><th>文件数</th></tr></thead><tbody>${versions}</tbody></table></div></section>
-<section class="band"><h2>测试版</h2><p class="muted">来自 <b>${escapeHtml(status.testReleaseRepo || '')}</b>。设置了 CF_API_TOKEN 的站点可在更新页面一键更新；其他站点下载部署包后手动上传到 Cloudflare Pages。</p><div class="table-wrap"><table><thead><tr><th>版本</th><th>发布时间</th><th>更新说明</th><th>下载</th></tr></thead><tbody>${testReleases}</tbody></table></div></section>
-<section class="band"><h2>插件工坊</h2><p class="muted">经审核后上架，测试版站点可在「模块管理 → 工坊」一键安装。想发布自己的插件：<a href="/workshop/submit">投稿插件</a>。插件拥有页面全部权限，请只安装信任的插件。</p><div class="table-wrap"><table><thead><tr><th>插件</th><th>版本</th><th>作者</th><th>说明</th><th>源码</th></tr></thead><tbody>${workshopPlugins}</tbody></table></div></section>
-<section class="band"><h2>暂不可用版本</h2><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit（前 12 位）</th><th>原因</th><th>发现时间</th></tr></thead><tbody>${pending}</tbody></table></div></section>
-<footer>清单可直接访问：<code>/manifest.json</code>、<code>/test-releases/manifest.json</code>、<code>/workshop/index.json</code></footer>
-</main>
-</body>
-</html>`;
+<section id="upstream" class="block" aria-labelledby="upstream-title">
+<div class="block-head"><div><h2 id="upstream-title">上游版本</h2><p class="muted small">来自 <a href="https://github.com/${escapeHtml(status.upstreamRepo)}">${escapeHtml(status.upstreamRepo)}</a>，补丁预检通过后收录。站点在「云同步 → 程序更新」选择版本。清单更新于 ${escapeHtml(formatShortTime(status.manifest.updatedAt))}（时间均为 UTC+8）。</p></div></div>
+<ul class="list card">${versionItems}</ul>
+${olderVersions}
+${pending}
+</section>
+<section id="test-builds" class="block" aria-labelledby="test-title">
+<div class="block-head"><div><h2 id="test-title">测试版</h2><p class="muted small">来自 ${escapeHtml(status.testReleaseRepo || '')}。设置了 CF_API_TOKEN 的站点在「云同步 → 测试版更新」一键更新；其他站点下载部署包后上传到 Cloudflare Pages。</p></div></div>
+${tests}
+</section>
+<section id="workshop" class="block" aria-labelledby="workshop-title">
+<div class="block-head"><div><h2 id="workshop-title">插件工坊</h2><p class="muted small">经审核上架，测试版站点在「模块管理 → 工坊」一键安装和更新。插件拥有页面全部权限，请只安装信任的插件。</p></div><a class="btn primary" href="/workshop/submit">投稿插件</a></div>
+${pluginCards}
+</section>`;
+    return renderShell({ title: '首页', active: '/', main });
 }
 
 function snapshotObjectKey(pathname) {

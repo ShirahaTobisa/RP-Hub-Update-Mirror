@@ -901,17 +901,22 @@ async function testStatusAndConsoleEscapeSecrets() {
     const html = await htmlResponse.text();
     for (const value of Object.values(secretValues)) assert.equal(html.includes(value), false);
     assert.equal(html.includes('<img src=x onerror=alert(1)>'), false);
-    assert(html.includes('&lt;img src=x onerror=alert(1)&gt;'));
     assert.equal(html.includes('<script>alert(2)</script>'), false);
-    assert(html.includes('&lt;script&gt;alert(2)&lt;/script&gt;'));
-    assert(html.includes('&lt;b&gt;STA1N156/RP-Hub&lt;/b&gt;'));
+    // 管理页的数据在浏览器里从 /api/status 加载，显示前统一经过页面里的 esc() 转义；这里直接检查 esc 的结果。
+    const escSource = html.match(/const esc=(\(value\)=>String\(value\?\?''\)[\s\S]*?\[character\]\)\));/)?.[1];
+    assert(escSource, 'admin page must define esc()');
+    const esc = new Function(`return ${escSource}`)();
+    assert.equal(esc('<img src=x onerror=alert(1)>'), '&lt;img src=x onerror=alert(1)&gt;');
+    assert.equal(esc('<script>alert(2)</script>'), '&lt;script&gt;alert(2)&lt;/script&gt;');
+    assert.equal(esc('<b>STA1N156/RP-Hub</b>'), '&lt;b&gt;STA1N156/RP-Hub&lt;/b&gt;');
+    assert.equal(esc(`"'&`), '&quot;&#39;&amp;');
     assert.equal(/https?:\/\/[^\s"']*(github-secret-value|webhook-secret-value|admin-secret-value)/.test(html), false);
 
     const publicResponse = await workerFetch(new Request('https://publisher.test/'), workerEnv);
     assert.equal(publicResponse.status, 200);
     assert.match(publicResponse.headers.get('content-security-policy'), /default-src 'none'/);
     const publicHtml = await publicResponse.text();
-    assert(publicHtml.includes('可更新版本'));
+    assert(publicHtml.includes('上游版本'));
     assert(publicHtml.includes('适配未通过，等待维护'));
     assert(publicHtml.includes('上游发布内容不完整'));
     assert(publicHtml.includes('&lt;img src=x onerror=alert(1)&gt;'));

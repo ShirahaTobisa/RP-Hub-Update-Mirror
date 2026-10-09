@@ -31,7 +31,7 @@ for (const corrupt of [null, 'not-json']) {
     const body = await response.text();
     assert.match(body, /公告暂时无法读取/);
     assert.match(body, /重试/);
-    assert.match(body, /可更新版本/);
+    assert.match(body, /上游版本/);
     assert.doesNotMatch(body, /请先在管理端/);
 }
 for (const [method, route] of [

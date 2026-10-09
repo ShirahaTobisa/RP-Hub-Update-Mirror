@@ -4,10 +4,10 @@ import { chromium } from 'playwright';
 import worker from '../worker.mjs';
 import { FakeR2 } from './r2.mjs';
 
-// 插件工坊页面：在浏览器里走一遍投稿 → 后台查看代码 → 上架 → 下架。
+// 插件工坊页面：在浏览器里走一遍投稿（前端预检）→ 后台审阅 → 上架 → 更新时看对比 → 下架。
 const ADMIN = 'browser-admin-token';
 const env = { MIRROR_BUCKET: new FakeR2(), ADMIN_TOKEN: ADMIN };
-const pluginSource = "RPHubSDK.register({ id: 'browser-demo', name: '浏览器示例', version: '1.0.0', requiresApi: 4, init() {} });";
+const pluginSource = (version, extra = '') => `RPHubSDK.register({\n    id: 'browser-demo', name: '浏览器示例', version: '${version}', requiresApi: 4,\n    init(ctx) {\n        ctx.log('ready');${extra}\n    }\n});\n`;
 const server = http.createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -26,33 +26,60 @@ const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (error) => errors.push(error.message));
 page.on('dialog', (dialog) => dialog.accept());
+
+async function submit(source, { name = '', author = '' } = {}) {
+    await page.goto(`${base}/workshop/submit`);
+    await page.setInputFiles('#file', { name: 'browser-demo.js', mimeType: 'text/javascript', buffer: Buffer.from(source) });
+    await page.waitForFunction(() => !document.querySelector('#check').hidden);
+    if (name) await page.fill('#name', name);
+    if (author) await page.fill('#author', author);
+    await page.fill('#description', '只用于测试');
+}
+
 try {
     await page.goto(`${base}/workshop/submit`);
-    await page.setInputFiles('#file', { name: 'browser-demo.js', mimeType: 'text/javascript', buffer: Buffer.from(pluginSource) });
-    await page.fill('#name', '浏览器示例');
-    await page.fill('#author', '测试作者');
-    await page.fill('#description', '只用于测试');
+    await page.setInputFiles('#file', { name: 'bad.js', mimeType: 'text/javascript', buffer: Buffer.from('console.log(1)') });
+    await page.waitForFunction(() => document.querySelector('#check').textContent.includes('RPHubSDK.register'));
+    assert.equal(await page.isDisabled('#submit'), true);
+    await submit(pluginSource('1.0.0'), { name: '浏览器示例', author: '测试作者' });
+    assert.equal(await page.textContent('#dKind'), '新插件');
+    assert.equal(await page.textContent('#dVersion'), '1.0.0');
     await page.click('#submit');
-    await page.waitForFunction(() => document.querySelector('#result').textContent.includes('已提交'));
-    assert.match(await page.textContent('#result'), /browser-demo v1\.0\.0/);
-    console.log('PASS submit page uploads a plugin into review');
+    await page.locator('#done').waitFor();
+    assert.match(await page.textContent('#doneText'), /browser-demo v1\.0\.0/);
+    console.log('PASS submit page checks the file in the browser and submits into review');
 
-    await page.goto(`${base}/admin`);
+    await page.goto(`${base}/admin#workshop`);
     await page.fill('#adminToken', ADMIN);
-    await page.click('#saveToken');
-    await page.click('#workshopRefresh');
-    await page.locator('.ws-view').waitFor();
-    await page.click('.ws-view');
-    await page.waitForFunction(() => document.querySelector('#workshopSource').textContent.includes('browser-demo'));
-    await page.click('.ws-approve');
+    await page.click('#authForm button[type=submit]');
+    await page.locator('.ws-review').waitFor();
+    await page.click('.ws-review');
+    await page.waitForFunction(() => document.querySelector('#reviewCode').textContent.includes('browser-demo'));
+    assert.equal(await page.isHidden('#viewDiff'), true, 'a new plugin has nothing to compare');
+    await page.click('#reviewApprove');
     await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('browser-demo'));
-    assert.match(await page.textContent('#workshopPendingBody'), /没有待审核的投稿/);
-    const index = await (await fetch(`${base}/workshop/index.json`)).json();
-    assert.deepEqual(index.plugins.map((plugin) => plugin.id), ['browser-demo']);
-    console.log('PASS admin page shows the source and publishes the submission');
+    assert.deepEqual((await (await fetch(`${base}/workshop/index.json`)).json()).plugins.map((plugin) => plugin.version), ['1.0.0']);
+    console.log('PASS admin reviews the full source and publishes the submission');
 
-    await page.click('.ws-remove');
-    await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('工坊暂无插件'));
+    await submit(pluginSource('1.0.0'));
+    assert.match(await page.textContent('#check'), /版本号和工坊里已上架的版本相同/);
+    assert.equal(await page.isDisabled('#submit'), true);
+    await submit(pluginSource('1.1.0', "\n        ctx.ui.toast('新功能');"));
+    assert.match(await page.textContent('#dKind'), /更新：工坊现有 v1\.0\.0（测试作者）/);
+    assert.equal(await page.inputValue('#author'), '测试作者', 'an update keeps the published author');
+    await page.click('#submit');
+    await page.locator('#done').waitFor();
+    await page.goto(`${base}/admin#workshop`);
+    await page.locator('.ws-review').click();
+    await page.waitForFunction(() => document.querySelector('#reviewCode .diff-sum'));
+    assert.equal(await page.locator('#reviewCode .ln.add').count(), 2);
+    assert.equal(await page.locator('#reviewCode .ln.del').count(), 1);
+    await page.click('#reviewApprove');
+    await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('v1.1.0'));
+    console.log('PASS updates are detected on submit and reviewed as a diff against the published version');
+
+    await page.locator('.ws-remove').click();
+    await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('工坊里还没有插件'));
     assert.deepEqual(errors, []);
     console.log('PASS admin page removes a published plugin');
 } finally {
