@@ -1545,6 +1545,116 @@ async function serveTestRelease(pathname, env) {
     });
 }
 
+// ---- 插件工坊：同步插件仓库主分支 plugins/<id>/{plugin.json,<id>.js}，供站点「模块管理 → 工坊」安装 ----
+const DEFAULT_WORKSHOP_REPO = 'ShirahaTobisa/RP-Hub-Workshop';
+const WORKSHOP_PREFIX = 'workshop';
+const WORKSHOP_INDEX_KEY = `${WORKSHOP_PREFIX}/index.json`;
+const WORKSHOP_PLUGIN_PATH_PATTERN = /^\/workshop\/plugins\/([a-z0-9-]{3,32})\.js$/;
+const WORKSHOP_META_PATTERN = /^plugins\/([a-z0-9-]{3,32})\/plugin\.json$/;
+const WORKSHOP_TEXT_LIMITS = { name: 40, version: 32, author: 40, description: 300 };
+const MAX_WORKSHOP_PLUGIN_BYTES = 2 * 1024 * 1024;
+const MAX_WORKSHOP_PLUGINS = 200;
+const CORS_HEADERS = { 'access-control-allow-origin': '*' };
+
+function workshopRepo(env) {
+    return typeof env?.WORKSHOP_REPO === 'string' && env.WORKSHOP_REPO.trim() ? env.WORKSHOP_REPO.trim() : DEFAULT_WORKSHOP_REPO;
+}
+
+// 与插件仓库 scripts/validate.mjs 的 plugin.json 规则一致；插件代码本身的检查在合并前由仓库 CI 完成。
+function validateWorkshopMeta(meta, id) {
+    if (!plainObject(meta) || meta.id !== id) throw new Error('plugin.json 的 id 与文件夹名不一致');
+    for (const [key, limit] of Object.entries(WORKSHOP_TEXT_LIMITS)) {
+        if (typeof meta[key] !== 'string' || !meta[key].trim() || meta[key].length > limit) throw new Error(`plugin.json 的 ${key} 无效`);
+    }
+    if (!Number.isInteger(meta.requiresApi) || meta.requiresApi < 1) throw new Error('plugin.json 的 requiresApi 无效');
+}
+
+// 主分支没变就跳过；变了逐个读取插件，文件内容没变的不重写。单个插件出错时保留它上一次上架的版本。
+export async function syncWorkshop(env, options = {}) {
+    const fetchImpl = options.fetchImpl || fetch;
+    const now = options.now || Date.now;
+    const bucket = env?.MIRROR_BUCKET;
+    if (!bucket) throw new Error('缺少 MIRROR_BUCKET R2 binding。');
+    const repo = workshopRepo(env);
+    const state = await readJsonObject(bucket, WORKSHOP_INDEX_KEY);
+    const head = await fetchGitHubJson(fetchImpl, env, `https://api.github.com/repos/${repo}/commits/main`);
+    const commit = typeof head?.sha === 'string' ? head.sha.toLowerCase() : '';
+    if (!/^[a-f0-9]{40}$/.test(commit)) throw new Error('插件仓库主分支 commit 无效。');
+    if (state.value?.commit === commit) return { ok: true, changed: false, pluginCount: state.value.plugins?.length || 0 };
+
+    const tree = await fetchGitHubJson(fetchImpl, env, `https://api.github.com/repos/${repo}/git/trees/${commit}?recursive=1`);
+    if (!Array.isArray(tree?.tree) || tree.truncated) throw new Error('插件仓库文件树不完整。');
+    const blobs = new Map(tree.tree.filter((entry) => entry?.type === 'blob').map((entry) => [entry.path, Number(entry.size || 0)]));
+    const ids = [...blobs.keys()].map((path) => path.match(WORKSHOP_META_PATTERN)?.[1]).filter(Boolean).sort().slice(0, MAX_WORKSHOP_PLUGINS);
+    const previous = new Map((Array.isArray(state.value?.plugins) ? state.value.plugins : []).map((plugin) => [plugin.id, plugin]));
+    const plugins = [];
+    const skipped = [];
+    for (const id of ids) {
+        try {
+            const sourcePath = `plugins/${id}/${id}.js`;
+            if (!blobs.has(sourcePath)) throw new Error(`缺少 ${sourcePath}`);
+            if (blobs.get(sourcePath) > MAX_WORKSHOP_PLUGIN_BYTES) throw new Error('插件文件超过 2MB');
+            const meta = JSON.parse(new TextDecoder().decode(await fetchRawFile(fetchImpl, env, repo, commit, `plugins/${id}/plugin.json`)));
+            validateWorkshopMeta(meta, id);
+            const bytes = await fetchRawFile(fetchImpl, env, repo, commit, sourcePath);
+            const sha256 = await sha256Bytes(bytes);
+            const known = previous.get(id);
+            const path = `/${WORKSHOP_PREFIX}/plugins/${id}.js`;
+            if (known?.file?.sha256 !== sha256) {
+                await bucket.put(path.slice(1), bytes, { httpMetadata: { contentType: 'text/javascript; charset=utf-8' } });
+            }
+            plugins.push({
+                id, name: meta.name, version: meta.version, author: meta.author, description: meta.description, requiresApi: meta.requiresApi,
+                updatedAt: known?.file?.sha256 === sha256 ? known.updatedAt : nowValue(now),
+                file: { path, sha256, size: bytes.byteLength }
+            });
+        } catch (error) {
+            skipped.push({ id, reason: toErrorMessage(error) });
+            if (previous.has(id)) plugins.push(previous.get(id));
+        }
+    }
+    const kept = new Set(plugins.map((plugin) => plugin.id));
+    const stale = [...previous.keys()].filter((id) => !kept.has(id)).map((id) => `${WORKSHOP_PREFIX}/plugins/${id}.js`);
+    const stored = await bucket.put(WORKSHOP_INDEX_KEY, JSON.stringify({ schema: 1, repo, commit, updatedAt: nowValue(now), plugins, skipped }, null, 2),
+        manifestPutOptions(state.object));
+    if (!stored) throw new ManifestConflictError();
+    if (stale.length) await bucket.delete(stale);
+    return { ok: true, changed: true, pluginCount: plugins.length, skipped };
+}
+
+async function syncWorkshopSafely(env, options) {
+    try {
+        return await syncWorkshop(env, options);
+    } catch (error) {
+        console.error(JSON.stringify({ message: 'workshop sync failed', error: safeErrorMessage(error, env) }));
+        return { ok: false, error: safeErrorMessage(error, env) };
+    }
+}
+
+async function readWorkshopPlugins(bucket) {
+    try {
+        const value = (await readJsonObject(bucket, WORKSHOP_INDEX_KEY)).value;
+        return Array.isArray(value?.plugins) ? value.plugins : [];
+    } catch {
+        return [];
+    }
+}
+
+async function serveWorkshop(pathname, env) {
+    const isIndex = pathname === `/${WORKSHOP_INDEX_KEY}`;
+    if (!isIndex && !WORKSHOP_PLUGIN_PATH_PATTERN.test(pathname)) return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404, headers: CORS_HEADERS });
+    const object = await env.MIRROR_BUCKET.get(pathname.slice(1));
+    if (!object) return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404, headers: CORS_HEADERS });
+    return new Response(object.body, {
+        headers: {
+            ...CORS_HEADERS,
+            'cache-control': isIndex ? 'public, max-age=60' : 'public, max-age=300',
+            'content-type': object.httpMetadata?.contentType || 'application/octet-stream',
+            'x-content-type-options': 'nosniff'
+        }
+    });
+}
+
 function effectiveRepo(env) {
     return typeof env?.UPSTREAM_REPO === 'string' && env.UPSTREAM_REPO.trim()
         ? env.UPSTREAM_REPO.trim()
@@ -1676,6 +1786,8 @@ async function buildPublicStatus(env) {
         manifest: publicManifest(manifestValue, env),
         upstreamRepo: statusString(effectiveRepo(env), env, 300),
         testReleases: await readTestReleaseVersions(bucket),
+        workshopPlugins: await readWorkshopPlugins(bucket),
+        workshopRepo: statusString(workshopRepo(env), env, 300),
         testReleaseRepo: statusString(testReleaseRepo(env), env, 300)
     };
 }
@@ -1855,6 +1967,15 @@ function renderPublicHtml(status, announcement = '') {
         <td><a href="${escapeHtml(version.zip.path)}">下载部署包</a></td>
     </tr>`).join('')
         : '<tr><td colspan="4" class="empty">暂无测试版</td></tr>';
+    const workshopPlugins = status.workshopPlugins?.length
+        ? status.workshopPlugins.map((plugin) => `<tr>
+        <td>${escapeHtml(plugin.name)}<br><code>${escapeHtml(plugin.id)}</code></td>
+        <td>${escapeHtml(plugin.version)}</td>
+        <td>${escapeHtml(plugin.author)}</td>
+        <td class="notes">${escapeHtml(plugin.description)}</td>
+        <td><a href="${escapeHtml(plugin.file.path)}">查看源码</a></td>
+    </tr>`).join('')
+        : '<tr><td colspan="5" class="empty">暂无插件</td></tr>';
     return `<!doctype html>
 <html lang="zh-Hans">
 <head>
@@ -1875,8 +1996,9 @@ a{color:var(--accent)}.announcement-link{display:inline-block;white-space:nowrap
 ${announcement}
 <section class="band"><h2>可更新版本</h2><p class="muted">点击“查看公告”可直接获取各版本公告，无需管理员口令。在站点更新页面点击“检测版本”即可获取最新清单。</p><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit（前 12 位）</th><th>上游日期</th><th>上架时间</th><th>文件数</th></tr></thead><tbody>${versions}</tbody></table></div></section>
 <section class="band"><h2>测试版</h2><p class="muted">来自 <b>${escapeHtml(status.testReleaseRepo || '')}</b>。设置了 CF_API_TOKEN 的站点可在更新页面一键更新；其他站点下载部署包后手动上传到 Cloudflare Pages。</p><div class="table-wrap"><table><thead><tr><th>版本</th><th>发布时间</th><th>更新说明</th><th>下载</th></tr></thead><tbody>${testReleases}</tbody></table></div></section>
+<section class="band"><h2>插件工坊</h2><p class="muted">来自 <b>${escapeHtml(status.workshopRepo || '')}</b>，经审核后上架。测试版站点可在「模块管理 → 工坊」一键安装；投稿方式见插件仓库说明。插件拥有页面全部权限，请只安装信任的插件。</p><div class="table-wrap"><table><thead><tr><th>插件</th><th>版本</th><th>作者</th><th>说明</th><th>源码</th></tr></thead><tbody>${workshopPlugins}</tbody></table></div></section>
 <section class="band"><h2>暂不可用版本</h2><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit（前 12 位）</th><th>原因</th><th>发现时间</th></tr></thead><tbody>${pending}</tbody></table></div></section>
-<footer>清单可直接访问：<code>/manifest.json</code>、<code>/test-releases/manifest.json</code></footer>
+<footer>清单可直接访问：<code>/manifest.json</code>、<code>/test-releases/manifest.json</code>、<code>/workshop/index.json</code></footer>
 </main>
 </body>
 </html>`;
@@ -2118,6 +2240,13 @@ async function handleRequest(request, env, options = {}) {
             return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
         }
     }
+    if (request.method === 'GET' && url.pathname.startsWith(`/${WORKSHOP_PREFIX}/`)) {
+        try {
+            return await serveWorkshop(url.pathname, env);
+        } catch (error) {
+            return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
+        }
+    }
     if (request.method === 'GET' && url.pathname.startsWith(`/${TEST_RELEASE_PREFIX}/`)) {
         try {
             return await serveTestRelease(url.pathname, env);
@@ -2169,7 +2298,11 @@ async function handleRequest(request, env, options = {}) {
         try {
             if (url.pathname === '/api/sync') {
                 const result = await syncMirror(env, runtimeOptions);
-                return jsonResponse({ ...result, testReleases: await syncTestReleasesSafely(env, runtimeOptions) });
+                return jsonResponse({
+                    ...result,
+                    testReleases: await syncTestReleasesSafely(env, runtimeOptions),
+                    workshop: await syncWorkshopSafely(env, runtimeOptions)
+                });
             }
             if (url.pathname === '/api/pending/retry') return await retryPending(request, env, runtimeOptions);
             if (url.pathname === '/api/versions/delete') return await deleteVersion(request, env, runtimeOptions);
@@ -2202,6 +2335,9 @@ export default {
         }));
         ctx.waitUntil(syncTestReleasesSafely(env).then((result) => {
             console.log(JSON.stringify({ message: 'test release scheduled sync complete', cron: controller.cron, ...result }));
+        }));
+        ctx.waitUntil(syncWorkshopSafely(env).then((result) => {
+            console.log(JSON.stringify({ message: 'workshop scheduled sync complete', cron: controller.cron, ...result }));
         }));
     }
 };

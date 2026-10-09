@@ -17,7 +17,7 @@ const STATIC_IMPORT = /^\s*import\b/m;
 const ANY_EXPORT = /^\s*export\s+/gm;
 const DEFAULT_EXPORT = /^\s*export\s+default\b/gm;
 // 测试用的同步入口：打包时去掉 export，只保留 export default。
-const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases'];
+const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases', 'syncWorkshop'];
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const sourceRoot = path.resolve(scriptDirectory, '..');
