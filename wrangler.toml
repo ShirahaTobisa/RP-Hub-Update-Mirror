@@ -7,6 +7,7 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 UPSTREAM_REPO = "STA1N156/RP-Hub"
 RELEASE_LIMIT = "12"
+TEST_RELEASE_REPO = "ShirahaTobisa/RP-Hub"
 
 [observability]
 enabled = true

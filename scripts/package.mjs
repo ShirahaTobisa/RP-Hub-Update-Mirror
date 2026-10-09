@@ -16,7 +16,8 @@ const EXPECTED_MODULE_EXPORTS = [
 const STATIC_IMPORT = /^\s*import\b/m;
 const ANY_EXPORT = /^\s*export\s+/gm;
 const DEFAULT_EXPORT = /^\s*export\s+default\b/gm;
-const SYNC_EXPORT = /^export\s+async\s+function\s+syncMirror\b/m;
+// 测试用的同步入口：打包时去掉 export，只保留 export default。
+const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases'];
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const sourceRoot = path.resolve(scriptDirectory, '..');
@@ -68,11 +69,14 @@ function inlineAppPatcher(workerSource, patcherSource) {
         ''
     ].join('\n');
     let bundled = workerSource.replace(importExpression, () => inlinedModule);
-    const syncExports = bundled.match(new RegExp(SYNC_EXPORT.source, 'gm')) || [];
-    if (syncExports.length !== 1) {
-        throw new Error(`Expected exactly one exported syncMirror; found ${syncExports.length}.`);
+    for (const name of SYNC_EXPORT_NAMES) {
+        const syncExport = new RegExp(`^export\\s+async\\s+function\\s+${name}\\b`, 'gm');
+        const syncExports = bundled.match(syncExport) || [];
+        if (syncExports.length !== 1) {
+            throw new Error(`Expected exactly one exported ${name}; found ${syncExports.length}.`);
+        }
+        bundled = bundled.replace(syncExport, `async function ${name}`);
     }
-    bundled = bundled.replace(SYNC_EXPORT, 'async function syncMirror');
 
     if (STATIC_IMPORT.test(bundled) || /\bimport\s*\(/.test(bundled)) {
         throw new Error('Bundled worker.js still contains an import statement.');

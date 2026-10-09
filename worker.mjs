@@ -1394,6 +1394,157 @@ export async function syncMirror(env, options = {}) {
     }
 }
 
+// ---- 测试版通道：同步测试版仓库里日期标签的 Release，供各站点一键自更新 ----
+const DEFAULT_TEST_RELEASE_REPO = 'ShirahaTobisa/RP-Hub';
+const TEST_RELEASE_PREFIX = 'test-releases';
+const TEST_RELEASE_MANIFEST_KEY = `${TEST_RELEASE_PREFIX}/manifest.json`;
+const TEST_RELEASE_TAG_PATTERN = /^\d{4}\.\d{2}\.\d{2}(?:\.\d+)?$/;
+const TEST_RELEASE_PATH_PATTERN = /^\/test-releases\/(\d{4}\.\d{2}\.\d{2}(?:\.\d+)?)\/(bundle\.json|RP-Hub-[\d.]+\.zip)$/;
+const TEST_RELEASE_LIMIT = 10;
+const MAX_TEST_RELEASE_ASSET_BYTES = 32 * 1024 * 1024;
+
+function testReleaseRepo(env) {
+    return typeof env?.TEST_RELEASE_REPO === 'string' && env.TEST_RELEASE_REPO.trim()
+        ? env.TEST_RELEASE_REPO.trim()
+        : DEFAULT_TEST_RELEASE_REPO;
+}
+
+function compareReleaseVersions(left, right) {
+    const a = String(left).split('.').map(Number);
+    const b = String(right).split('.').map(Number);
+    for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+        const diff = (a[index] || 0) - (b[index] || 0);
+        if (diff) return diff;
+    }
+    return 0;
+}
+
+async function downloadReleaseAsset(fetchImpl, env, asset) {
+    if (Number(asset.size) > MAX_TEST_RELEASE_ASSET_BYTES) throw new Error(`Release 附件过大：${asset.name}`);
+    const response = await fetchWithTimeout(fetchImpl, asset.url, { headers: githubHeaders(env, 'application/octet-stream') });
+    if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
+        throw new Error(`下载 Release 附件失败：${asset.name}；HTTP ${response.status}`);
+    }
+    return new Uint8Array(await response.arrayBuffer());
+}
+
+function validateTestReleaseBundle(bytes, tag) {
+    let bundle;
+    try {
+        bundle = JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+        throw new Error(`发布包不是有效 JSON：${tag}`);
+    }
+    const validPath = (path) => typeof path === 'string' && path && !path.startsWith('/') && !path.includes('..');
+    if (bundle?.format !== 'rph-release-bundle-v1' || bundle.version !== tag || typeof bundle.worker !== 'string' || !bundle.worker
+        || !Array.isArray(bundle.assets) || !bundle.assets.length
+        || !bundle.assets.every((asset) => validPath(asset?.path) && typeof asset.base64 === 'string')) {
+        throw new Error(`发布包格式无效：${tag}`);
+    }
+}
+
+async function storeTestRelease(fetchImpl, env, bucket, release, bundleAsset, zipAsset, now) {
+    const tag = release.tag_name;
+    const bundleBytes = await downloadReleaseAsset(fetchImpl, env, bundleAsset);
+    validateTestReleaseBundle(bundleBytes, tag);
+    const zipBytes = await downloadReleaseAsset(fetchImpl, env, zipAsset);
+    const base = `${TEST_RELEASE_PREFIX}/${tag}`;
+    await bucket.put(`${base}/bundle.json`, bundleBytes, { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+    await bucket.put(`${base}/${zipAsset.name}`, zipBytes, { httpMetadata: { contentType: 'application/zip' } });
+    return {
+        tag,
+        name: typeof release.name === 'string' && release.name ? release.name : tag,
+        notes: String(release.body || '').slice(0, 4000),
+        publishedAt: Date.parse(release.published_at) || nowValue(now),
+        bundle: { path: `/${base}/bundle.json`, sha256: await sha256Bytes(bundleBytes), size: bundleBytes.byteLength, assetId: bundleAsset.id },
+        zip: { path: `/${base}/${zipAsset.name}`, sha256: await sha256Bytes(zipBytes), size: zipBytes.byteLength, assetId: zipAsset.id }
+    };
+}
+
+// 只下载新增或附件有变化的版本；GitHub 上已删除的版本连同文件一起下架。单个版本出错不影响其他版本。
+export async function syncTestReleases(env, options = {}) {
+    const fetchImpl = options.fetchImpl || fetch;
+    const now = options.now || Date.now;
+    const bucket = env?.MIRROR_BUCKET;
+    if (!bucket) throw new Error('缺少 MIRROR_BUCKET R2 binding。');
+    const repo = testReleaseRepo(env);
+    const state = await readJsonObject(bucket, TEST_RELEASE_MANIFEST_KEY);
+    const previous = new Map((Array.isArray(state.value?.versions) ? state.value.versions : []).map((version) => [version.tag, version]));
+    const releases = await fetchGitHubJson(fetchImpl, env, `https://api.github.com/repos/${repo}/releases?per_page=30`);
+    if (!Array.isArray(releases)) throw new Error('测试版 Release 列表格式异常。');
+    const candidates = releases
+        .filter((release) => !release?.draft && TEST_RELEASE_TAG_PATTERN.test(release?.tag_name))
+        .sort((left, right) => compareReleaseVersions(right.tag_name, left.tag_name))
+        .slice(0, TEST_RELEASE_LIMIT);
+    const versions = [];
+    const skipped = [];
+    for (const release of candidates) {
+        const tag = release.tag_name;
+        const assets = Array.isArray(release.assets) ? release.assets : [];
+        const bundleAsset = assets.find((asset) => asset?.name === `rph-bundle-${tag}.json`);
+        const zipAsset = assets.find((asset) => asset?.name === `RP-Hub-${tag}.zip`);
+        const known = previous.get(tag);
+        if (!bundleAsset || !zipAsset) {
+            skipped.push({ tag, reason: '附件不全，可能仍在打包' });
+            continue;
+        }
+        if (known?.bundle?.assetId === bundleAsset.id && known?.zip?.assetId === zipAsset.id) {
+            versions.push(known);
+            continue;
+        }
+        try {
+            versions.push(await storeTestRelease(fetchImpl, env, bucket, release, bundleAsset, zipAsset, now));
+        } catch (error) {
+            skipped.push({ tag, reason: toErrorMessage(error) });
+            if (known) versions.push(known);
+        }
+    }
+    const kept = new Set(versions.flatMap((version) => [version.bundle.path, version.zip.path]));
+    const stale = [...previous.values()].flatMap((version) => [version.bundle?.path, version.zip?.path])
+        .filter((path) => typeof path === 'string' && !kept.has(path)).map((path) => path.slice(1));
+    const changed = JSON.stringify(state.value?.versions || []) !== JSON.stringify(versions);
+    if (changed || !state.object) {
+        const stored = await bucket.put(TEST_RELEASE_MANIFEST_KEY, JSON.stringify({ schema: 1, repo, updatedAt: nowValue(now), versions }, null, 2),
+            manifestPutOptions(state.object));
+        if (!stored) throw new ManifestConflictError();
+    }
+    if (stale.length) await bucket.delete(stale);
+    return { ok: true, changed, versionCount: versions.length, skipped };
+}
+
+async function syncTestReleasesSafely(env, options) {
+    try {
+        return await syncTestReleases(env, options);
+    } catch (error) {
+        console.error(JSON.stringify({ message: 'test release sync failed', error: safeErrorMessage(error, env) }));
+        return { ok: false, error: safeErrorMessage(error, env) };
+    }
+}
+
+async function readTestReleaseVersions(bucket) {
+    try {
+        const value = (await readJsonObject(bucket, TEST_RELEASE_MANIFEST_KEY)).value;
+        return Array.isArray(value?.versions) ? value.versions : [];
+    } catch {
+        return [];
+    }
+}
+
+async function serveTestRelease(pathname, env) {
+    const isManifest = pathname === `/${TEST_RELEASE_MANIFEST_KEY}`;
+    if (!isManifest && !TEST_RELEASE_PATH_PATTERN.test(pathname)) return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404 });
+    const object = await env.MIRROR_BUCKET.get(pathname.slice(1));
+    if (!object) return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404 });
+    return new Response(object.body, {
+        headers: {
+            'cache-control': isManifest ? 'public, max-age=60' : 'public, max-age=86400, immutable',
+            'content-type': object.httpMetadata?.contentType || 'application/octet-stream',
+            'x-content-type-options': 'nosniff'
+        }
+    });
+}
+
 function effectiveRepo(env) {
     return typeof env?.UPSTREAM_REPO === 'string' && env.UPSTREAM_REPO.trim()
         ? env.UPSTREAM_REPO.trim()
@@ -1523,7 +1674,9 @@ async function buildPublicStatus(env) {
     }
     return {
         manifest: publicManifest(manifestValue, env),
-        upstreamRepo: statusString(effectiveRepo(env), env, 300)
+        upstreamRepo: statusString(effectiveRepo(env), env, 300),
+        testReleases: await readTestReleaseVersions(bucket),
+        testReleaseRepo: statusString(testReleaseRepo(env), env, 300)
     };
 }
 
@@ -1694,6 +1847,14 @@ function renderPublicHtml(status, announcement = '') {
         <td>${escapeHtml(formatStatusTime(item.seenAt))}</td>
     </tr>`).join('')
         : '<tr><td colspan="4" class="empty">无</td></tr>';
+    const testReleases = status.testReleases?.length
+        ? status.testReleases.map((version) => `<tr>
+        <td>${escapeHtml(version.tag)}</td>
+        <td>${escapeHtml(formatStatusTime(version.publishedAt))}</td>
+        <td class="notes">${escapeHtml(version.notes || '无')}</td>
+        <td><a href="${escapeHtml(version.zip.path)}">下载部署包</a></td>
+    </tr>`).join('')
+        : '<tr><td colspan="4" class="empty">暂无测试版</td></tr>';
     return `<!doctype html>
 <html lang="zh-Hans">
 <head>
@@ -1703,7 +1864,7 @@ function renderPublicHtml(status, announcement = '') {
 <title>RP-Hub 镜像状态</title>
 <style>
 a{color:var(--accent)}.announcement-link{display:inline-block;white-space:nowrap;padding:3px 0}#announcement{scroll-margin-top:16px}#announcement pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;margin:12px 0;line-height:1.8}#announcement h3{font-size:16px}#announcement button{font:inherit;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:5px 12px;cursor:pointer}
-:root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d8dde3;--text:#17202a;--muted:#66717d;--accent:#146c43}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:0}header{background:var(--panel);border-bottom:1px solid var(--line)}.wrap{width:min(1080px,calc(100% - 32px));margin:auto}.top{padding:26px 0 22px}h1{font-size:25px;margin:0 0 6px}h2{font-size:17px;margin:0 0 12px}.muted,.stamp{color:var(--muted)}main{padding:24px 0 42px}.meta{display:flex;flex-wrap:wrap;gap:8px 26px;padding:14px 0 20px;border-bottom:1px solid var(--line)}.meta span{overflow-wrap:anywhere}.band{padding:22px 0;border-bottom:1px solid var(--line)}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}table{width:100%;border-collapse:collapse;min-width:720px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{background:#eef1f4;color:#3d4854;font-size:12px}tr:last-child td{border-bottom:0}code{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.empty{text-align:center;color:var(--muted);padding:24px}footer{padding-top:22px;color:var(--muted);font-size:12px}@media(max-width:800px){.wrap{width:min(100% - 20px,1080px)}h1{font-size:22px}}
+:root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--line:#d8dde3;--text:#17202a;--muted:#66717d;--accent:#146c43}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:0}header{background:var(--panel);border-bottom:1px solid var(--line)}.wrap{width:min(1080px,calc(100% - 32px));margin:auto}.top{padding:26px 0 22px}h1{font-size:25px;margin:0 0 6px}h2{font-size:17px;margin:0 0 12px}.muted,.stamp{color:var(--muted)}main{padding:24px 0 42px}.meta{display:flex;flex-wrap:wrap;gap:8px 26px;padding:14px 0 20px;border-bottom:1px solid var(--line)}.meta span{overflow-wrap:anywhere}.band{padding:22px 0;border-bottom:1px solid var(--line)}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}table{width:100%;border-collapse:collapse;min-width:720px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{background:#eef1f4;color:#3d4854;font-size:12px}tr:last-child td{border-bottom:0}code{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.notes{white-space:pre-wrap;overflow-wrap:anywhere}.empty{text-align:center;color:var(--muted);padding:24px}footer{padding-top:22px;color:var(--muted);font-size:12px}@media(max-width:800px){.wrap{width:min(100% - 20px,1080px)}h1{font-size:22px}}
 @media(prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#111417;--panel:#191d21;--line:#343b43;--text:#eef1f4;--muted:#a6afb9;--accent:#78d9ac}th{background:#252b31;color:var(--muted)}}
 </style>
 </head>
@@ -1713,8 +1874,9 @@ a{color:var(--accent)}.announcement-link{display:inline-block;white-space:nowrap
 <div class="meta"><span>上游仓库：<b>${escapeHtml(status.upstreamRepo)}</b></span><span>页面生成时间：<b>${escapeHtml(formatStatusTime(Date.now()))}</b></span><span>清单更新时间：<b>${escapeHtml(formatStatusTime(status.manifest.updatedAt))}</b></span></div>
 ${announcement}
 <section class="band"><h2>可更新版本</h2><p class="muted">点击“查看公告”可直接获取各版本公告，无需管理员口令。在站点更新页面点击“检测版本”即可获取最新清单。</p><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit（前 12 位）</th><th>上游日期</th><th>上架时间</th><th>文件数</th></tr></thead><tbody>${versions}</tbody></table></div></section>
+<section class="band"><h2>测试版</h2><p class="muted">来自 <b>${escapeHtml(status.testReleaseRepo || '')}</b>。设置了 CF_API_TOKEN 的站点可在更新页面一键更新；其他站点下载部署包后手动上传到 Cloudflare Pages。</p><div class="table-wrap"><table><thead><tr><th>版本</th><th>发布时间</th><th>更新说明</th><th>下载</th></tr></thead><tbody>${testReleases}</tbody></table></div></section>
 <section class="band"><h2>暂不可用版本</h2><div class="table-wrap"><table><thead><tr><th>Tag</th><th>Commit（前 12 位）</th><th>原因</th><th>发现时间</th></tr></thead><tbody>${pending}</tbody></table></div></section>
-<footer>清单可直接访问：<code>/manifest.json</code></footer>
+<footer>清单可直接访问：<code>/manifest.json</code>、<code>/test-releases/manifest.json</code></footer>
 </main>
 </body>
 </html>`;
@@ -1956,6 +2118,13 @@ async function handleRequest(request, env, options = {}) {
             return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
         }
     }
+    if (request.method === 'GET' && url.pathname.startsWith(`/${TEST_RELEASE_PREFIX}/`)) {
+        try {
+            return await serveTestRelease(url.pathname, env);
+        } catch (error) {
+            return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
+        }
+    }
     if (request.method === 'GET' && url.pathname === '/') {
         try {
             const status = await buildPublicStatus(env);
@@ -1998,7 +2167,10 @@ async function handleRequest(request, env, options = {}) {
         const forbidden = await authorizeWrite(request, env);
         if (forbidden) return forbidden;
         try {
-            if (url.pathname === '/api/sync') return jsonResponse(await syncMirror(env, runtimeOptions));
+            if (url.pathname === '/api/sync') {
+                const result = await syncMirror(env, runtimeOptions);
+                return jsonResponse({ ...result, testReleases: await syncTestReleasesSafely(env, runtimeOptions) });
+            }
             if (url.pathname === '/api/pending/retry') return await retryPending(request, env, runtimeOptions);
             if (url.pathname === '/api/versions/delete') return await deleteVersion(request, env, runtimeOptions);
             if (url.pathname === '/api/config') return await updateRuntimeConfig(request, env);
@@ -2027,6 +2199,9 @@ export default {
                 cron: controller.cron,
                 ...result
             }));
+        }));
+        ctx.waitUntil(syncTestReleasesSafely(env).then((result) => {
+            console.log(JSON.stringify({ message: 'test release scheduled sync complete', cron: controller.cron, ...result }));
         }));
     }
 };

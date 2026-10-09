@@ -66,8 +66,8 @@ export class FakeR2 {
         return new FakeR2Object(record);
     }
 
-    async delete(key) {
-        this.records.delete(key);
+    async delete(keys) {
+        for (const key of Array.isArray(keys) ? keys : [keys]) this.records.delete(key);
     }
 
     seedJson(key, value) {
