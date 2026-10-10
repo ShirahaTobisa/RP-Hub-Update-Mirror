@@ -1992,6 +1992,7 @@ const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
 const DEPLOY_PROJECT_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?$/;
 const DEPLOY_BUCKET_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$/;
 const DEPLOY_ACCOUNT_PATTERN = /^[a-f0-9]{32}$/;
+const DEPLOY_DOMAIN_PATTERN = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const DEPLOY_CONTENT_TYPES = {
     html: 'text/html; charset=utf-8', js: 'text/javascript; charset=utf-8', mjs: 'text/javascript; charset=utf-8',
     css: 'text/css; charset=utf-8', json: 'application/json; charset=utf-8', svg: 'image/svg+xml', png: 'image/png',
@@ -2074,6 +2075,41 @@ async function uploadPagesBundle(fetchImpl, token, account, project, bundle) {
     return cfCall(fetchImpl, token, `${projectPath}/deployments`, { method: 'POST', body: form });
 }
 
+// 自定义域名：先加到 Pages 项目；域名托管在同一帐户时再补一条 CNAME。缺权限或已有记录指向别处时不覆盖，返回手动操作说明。
+async function attachCustomDomain(fetchImpl, token, account, project, domain, subdomain) {
+    const manual = `在域名的 DNS 里添加 CNAME 记录：${domain} → ${subdomain}`;
+    try {
+        await cfCall(fetchImpl, token, `/accounts/${account}/pages/projects/${project}/domains`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: domain })
+        });
+    } catch (error) {
+        if (!/already|exist/i.test(error.message)) return { name: domain, status: 'failed', message: `域名没能加到项目：${error.message}` };
+    }
+    const labels = domain.split('.');
+    let zone = null;
+    try {
+        for (let index = 0; index < labels.length - 1 && !zone; index += 1) {
+            const zones = await cfCall(fetchImpl, token, `/zones?name=${labels.slice(index).join('.')}&account.id=${account}`);
+            zone = zones[0] || null;
+        }
+    } catch (_) {
+        return { name: domain, status: 'manual', message: `令牌没有读取域名的权限。${manual}` };
+    }
+    if (!zone) return { name: domain, status: 'manual', message: `这个域名不在该 Cloudflare 帐户里。${manual}` };
+    try {
+        const records = await cfCall(fetchImpl, token, `/zones/${zone.id}/dns_records?name=${domain}`);
+        if (records.some((item) => item.type === 'CNAME' && item.content === subdomain)) return { name: domain, status: 'ready', message: 'DNS 记录已存在。' };
+        if (records.length) return { name: domain, status: 'manual', message: `${domain} 已有其他 DNS 记录，没有覆盖。需要时把它改成 CNAME → ${subdomain}。` };
+        await cfCall(fetchImpl, token, `/zones/${zone.id}/dns_records`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ type: 'CNAME', name: domain, content: subdomain, proxied: true })
+        });
+        return { name: domain, status: 'ready', message: '已自动添加 DNS 记录，证书签发通常要几分钟。' };
+    } catch (_) {
+        return { name: domain, status: 'manual', message: `令牌没有修改 DNS 的权限。${manual}` };
+    }
+}
+
 async function runDeploy(request, env, options) {
     const fetchImpl = options.fetchImpl;
     const body = await readJsonRequest(request, 8 * 1024).catch(() => null);
@@ -2085,6 +2121,8 @@ async function runDeploy(request, env, options) {
     if (password.length < 6) throw new DeployError('同步密码至少 6 位。');
     if (!DEPLOY_PROJECT_PATTERN.test(projectName)) throw new DeployError('项目名只能用小写字母、数字和短横线，最多 58 个字符。');
     if (!DEPLOY_BUCKET_PATTERN.test(bucketName)) throw new DeployError('存储桶名只能用小写字母、数字和短横线，3～63 个字符。');
+    const customDomain = String(body?.customDomain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    if (customDomain && (!DEPLOY_DOMAIN_PATTERN.test(customDomain) || customDomain.endsWith('.pages.dev'))) throw new DeployError('自定义域名格式不对，例如 rph.example.com。');
     const accounts = await listDeployAccounts(token, fetchImpl);
     let account = String(body?.accountId || '').trim();
     if (account && !DEPLOY_ACCOUNT_PATTERN.test(account)) throw new DeployError('帐户 ID 格式不对，应为 32 位字符。');
@@ -2098,7 +2136,7 @@ async function runDeploy(request, env, options) {
     const bundle = await readLatestTestBundle(env.MIRROR_BUCKET);
 
     // 项目已存在时不直接覆盖：前端确认后带 overwrite 再来。
-    const projectPath = `/accounts/${account}/pages/projects/${projectName}`;
+    let projectPath = `/accounts/${account}/pages/projects/${projectName}`;
     let project = await cfCall(fetchImpl, token, projectPath).catch((error) => {
         if (error.cfStatus === 404 || error.cfCodes?.includes(8000007)) return null;
         throw error;
@@ -2106,12 +2144,19 @@ async function runDeploy(request, env, options) {
     if (project && body?.overwrite !== true) {
         throw new DeployError(`项目「${projectName}」已存在。继续会用最新测试版覆盖它，并重新设置存储桶绑定和同步密码。`, 'PROJECT_EXISTS', 409);
     }
-    if (!project) {
+    // 项目名同时是 *.pages.dev 网址，全体 Cloudflare 用户共用；被别人占用时加随机后缀重试。
+    for (let attempt = 0; !project; attempt += 1) {
+        const name = attempt ? `${projectName.slice(0, 52)}-${crypto.randomUUID().slice(0, 4)}` : projectName;
         project = await cfCall(fetchImpl, token, `/accounts/${account}/pages/projects`, {
             method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ name: projectName, production_branch: 'main' })
+            body: JSON.stringify({ name, production_branch: 'main' })
+        }).catch((error) => {
+            if (!/subdomain is unavailable|already in use|already exists/i.test(error.message) || attempt >= 3) throw error;
+            return null;
         });
+        if (project) projectPath = `/accounts/${account}/pages/projects/${project.name || name}`;
     }
+    const finalName = project.name || projectName;
     const bucketPath = `/accounts/${account}/r2/buckets/${bucketName}`;
     const existingBucket = await cfCall(fetchImpl, token, bucketPath).catch((error) => {
         if (error.cfStatus === 404 || error.cfCodes?.includes(10006)) return null;
@@ -2142,11 +2187,15 @@ async function runDeploy(request, env, options) {
             }
         })
     });
-    const deployment = await uploadPagesBundle(fetchImpl, token, account, projectName, bundle);
+    const deployment = await uploadPagesBundle(fetchImpl, token, account, finalName, bundle);
+    const subdomain = project.subdomain || `${finalName}.pages.dev`;
+    const domain = customDomain ? await attachCustomDomain(fetchImpl, token, account, finalName, customDomain, subdomain) : null;
     return {
         ok: true,
         version: bundle.version,
-        url: `https://${project.subdomain || `${projectName}.pages.dev`}`,
+        projectName: finalName,
+        url: `https://${subdomain}`,
+        customDomain: domain,
         deploymentUrl: deployment.url || '',
         bucketCreated: !existingBucket
     };
@@ -2173,12 +2222,12 @@ const form=byId('deployForm'),status=byId('deployStatus'),accountField=byId('acc
 let overwrite=false;
 function say(text,kind){status.textContent=text;status.className='notice'+(kind?' '+kind:'');status.hidden=!text;}
 async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const value=await response.json().catch(()=>({ok:false,error:'HTTP '+response.status}));return value;}
-function payload(){return{token:byId('token').value.trim(),accountId:accountField.hidden?'':accountSelect.value,projectName:byId('project').value.trim(),bucketName:byId('bucket').value.trim(),password:byId('password').value,overwrite};}
+function payload(){return{token:byId('token').value.trim(),accountId:accountField.hidden?'':accountSelect.value,projectName:byId('project').value.trim(),customDomain:byId('domain').value.trim(),bucketName:byId('bucket').value.trim(),password:byId('password').value,overwrite};}
 byId('token').addEventListener('change',()=>{accountField.hidden=true;accountSelect.innerHTML='';overwrite=false;});
 byId('project').addEventListener('input',()=>{overwrite=false;});
 form.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;say('正在部署，约需半分钟，请不要关闭页面…');
 try{const result=await post('/api/deploy',payload());
-if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;form.hidden=true;byId('done').hidden=false;return;}
+if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;byId('doneDomain').textContent=result.customDomain?('自定义域名 '+result.customDomain.name+'：'+result.customDomain.message):'';byId('doneDomain').hidden=!result.customDomain;byId('doneName').textContent=result.projectName;form.hidden=true;byId('done').hidden=false;return;}
 if(result.code==='CHOOSE_ACCOUNT'||result.code==='NEED_ACCOUNT'){const list=await post('/api/deploy/accounts',{token:byId('token').value.trim()});accountSelect.innerHTML='';(list.accounts||[]).forEach((item)=>{const option=document.createElement('option');option.value=item.id;option.textContent=item.name+'（'+item.id.slice(0,8)+'…）';accountSelect.appendChild(option);});if(result.code==='NEED_ACCOUNT'){byId('accountManual').hidden=false;}accountField.hidden=false;say(result.error,'warn');return;}
 if(result.code==='PROJECT_EXISTS'){if(confirm(result.error+'\n\n确定继续吗？')){overwrite=true;submit.disabled=false;form.requestSubmit();return;}say('已取消。换个项目名再部署，或确认覆盖。','warn');return;}
 say(result.error||'部署失败','error');}catch(error){say('部署失败：'+error.message,'error');}finally{submit.disabled=false;}});
@@ -2193,19 +2242,21 @@ function renderDeployHtml() {
 <form id="deployForm" class="card pad form" style="margin-top:20px">
 <label class="field">Cloudflare 令牌<small>按「创建令牌」里的说明创建；分发站只在这次部署中使用，不保存。</small><input id="token" type="password" autocomplete="off" required></label>
 <div id="accountField" class="field" hidden><span>部署到哪个帐户</span><select id="account"></select><label id="accountManual" class="field" hidden>帐户 ID<small>后台网址 dash.cloudflare.com/ 后面那串 32 位字符</small><input id="accountManualInput" maxlength="32"></label></div>
-<label class="field">项目名<small>会成为网址 <code>项目名.pages.dev</code>；小写字母、数字和短横线</small><input id="project" maxlength="58" required placeholder="my-rph"></label>
+<label class="field">项目名<small>会成为网址 <code>项目名.pages.dev</code>；小写字母、数字和短横线；被别人用过会自动加后缀</small><input id="project" maxlength="58" required placeholder="my-rph"></label>
+<label class="field">自定义域名<small>选填，例如 rph.example.com；不填就用 pages.dev 网址</small><input id="domain" maxlength="253" placeholder="rph.example.com"></label>
 <label class="field">存储桶名<small>云同步、图片都存在这里；已有同名桶会直接使用</small><input id="bucket" maxlength="63" required value="rph-data"></label>
 <label class="field">同步密码<small>至少 6 位；以后在站点里同步、管理图片都要用</small><input id="password" type="password" autocomplete="new-password" minlength="6" required></label>
 <p id="deployStatus" class="notice" hidden></p>
 <div class="actions"><button id="deploy" class="btn primary" type="submit">部署</button></div>
 </form>
-<div id="done" class="card pad" hidden style="margin-top:20px"><h2>部署完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>。第一次打开可能要等半分钟生效。</p><p class="notes">之后在站点「同步 → 测试版更新」里就能一键更新，不需要再来这里。</p></div>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>部署完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>。第一次打开可能要等半分钟生效。</p><p class="notes">项目名：<code id="doneName"></code>（原名被占用时会自动加后缀）。</p><p id="doneDomain" class="notes" hidden></p><p class="notes">之后在站点「同步 → 测试版更新」里就能一键更新，不需要再来这里。</p></div>
 </section>
 <aside class="card pad side">
 <h2>创建令牌</h2>
 <ol>
 <li>打开 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">API 令牌</a> →「创建令牌」→「创建自定义令牌」。</li>
 <li>权限添加三项：<br>帐户 → Cloudflare Pages → 编辑<br>帐户 → Workers R2 存储 → 编辑<br>帐户 → 帐户设置 → 读取</li>
+<li>要用自定义域名，再加两项：区域 → 区域 → 读取、区域 → DNS → 编辑（区域资源选你的域名）。不加也能部署，只是要自己去加 DNS 记录。</li>
 <li>帐户资源选你要部署的帐户，创建后复制令牌。</li>
 </ol>
 <h2>这个令牌会被怎样使用</h2>

@@ -14,7 +14,7 @@ bucket.seedJson('test-releases/2026.10.10.6/bundle.json', {
 });
 const env = { MIRROR_BUCKET: bucket };
 
-let accounts, projects, buckets, r2Enabled;
+let accounts, projects, buckets, r2Enabled, takenNames, zones, dnsRecords;
 const calls = [];
 const ok = (result) => Response.json({ success: true, result });
 const fail = (status, message, code = 1000) => Response.json({ success: false, errors: [{ code, message }] }, { status });
@@ -23,6 +23,9 @@ function reset() {
     projects = new Map();
     buckets = new Set();
     r2Enabled = true;
+    takenNames = new Set();
+    zones = [];
+    dnsRecords = [];
     calls.length = 0;
 }
 globalThis.fetch = async (input, init = {}) => {
@@ -38,6 +41,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (project && method === 'PATCH') return ok({ ...projects.get(project[2]), patched: true });
     if (/\/pages\/projects$/.test(path) && method === 'POST') {
         const name = JSON.parse(init.body).name;
+        if (takenNames.has(name)) return fail(400, 'Subdomain is unavailable. This `*.pages.dev` subdomain is already in use. Select another subdomain.', 8000000);
         projects.set(name, { name, subdomain: `${name}-x1.pages.dev` });
         return ok(projects.get(name));
     }
@@ -49,6 +53,11 @@ globalThis.fetch = async (input, init = {}) => {
         return ok({ name: JSON.parse(init.body).name });
     }
     if (path.endsWith('/upload-token')) return ok({ jwt: 'upload-jwt' });
+    if (/\/pages\/projects\/[\w-]+\/domains$/.test(path)) return ok({ name: JSON.parse(init.body).name, status: 'pending' });
+    if (path === '/zones') return ok(zones.filter((zone) => zone.name === url.searchParams.get('name')));
+    const dns = path.match(/^\/zones\/(\w+)\/dns_records$/);
+    if (dns && method === 'GET') return ok(dnsRecords.filter((item) => item.name === url.searchParams.get('name')));
+    if (dns && method === 'POST') { dnsRecords.push(JSON.parse(init.body)); return ok(JSON.parse(init.body)); }
     if (path === '/pages/assets/check-missing') return ok(JSON.parse(init.body).hashes);
     if (path === '/pages/assets/upload' || path === '/pages/assets/upsert-hashes') return ok(true);
     if (path.endsWith('/deployments') && method === 'POST') return ok({ id: 'dep-1', url: 'https://dep-1.my-rph-x1.pages.dev' });
@@ -64,7 +73,7 @@ const base = { token: 'cf-token', projectName: 'my-rph', bucketName: 'rph-data',
 reset();
 let result = await deploy(base);
 assert.equal(result.status, 200, JSON.stringify(result.body));
-assert.deepEqual(result.body, { ok: true, version: '2026.10.10.6', url: 'https://my-rph-x1.pages.dev', deploymentUrl: 'https://dep-1.my-rph-x1.pages.dev', bucketCreated: true });
+assert.deepEqual(result.body, { ok: true, version: '2026.10.10.6', projectName: 'my-rph', url: 'https://my-rph-x1.pages.dev', customDomain: null, deploymentUrl: 'https://dep-1.my-rph-x1.pages.dev', bucketCreated: true });
 const patch = calls.find((call) => call.method === 'PATCH').body.deployment_configs.production;
 assert.deepEqual(patch.r2_buckets, { RP_SYNC_R2: { name: 'rph-data' } });
 assert.deepEqual(patch.env_vars.RP_SYNC_PASSWORD, { type: 'secret_text', value: 'secret-pass' });
@@ -112,6 +121,35 @@ for (const bad of [{ password: '123' }, { projectName: 'Bad_Name' }, { bucketNam
     assert.equal((await deploy({ ...base, ...bad })).status, 400, JSON.stringify(bad));
 }
 console.log('PASS R2 not enabled, invalid tokens and invalid inputs return clear errors');
+
+// 项目名对应的 pages.dev 网址被别人占用：自动加后缀重试，返回实际项目名。
+reset();
+takenNames.add('my-rph');
+result = await deploy(base);
+assert.equal(result.body.ok, true, JSON.stringify(result.body));
+assert.match(result.body.projectName, /^my-rph-[a-z0-9]{4}$/);
+assert.ok(calls.some((call) => call.path.endsWith(`/pages/projects/${result.body.projectName}/deployments`)), 'the deployment goes to the renamed project');
+console.log('PASS a taken pages.dev name is retried with a short suffix');
+
+// 自定义域名：同帐户里的域名自动加 CNAME；不在帐户里或已有其他记录时只给出手动说明，不覆盖。
+reset();
+zones = [{ id: 'zone1', name: 'example.com' }];
+result = await deploy({ ...base, customDomain: 'https://RPH.example.com/' });
+assert.equal(result.body.customDomain.status, 'ready', JSON.stringify(result.body.customDomain));
+assert.deepEqual(dnsRecords, [{ type: 'CNAME', name: 'rph.example.com', content: 'my-rph-x1.pages.dev', proxied: true }]);
+assert.ok(calls.some((call) => call.path.endsWith('/pages/projects/my-rph/domains') && call.body.name === 'rph.example.com'));
+reset();
+zones = [{ id: 'zone1', name: 'example.com' }];
+dnsRecords = [{ type: 'A', name: 'rph.example.com', content: '1.2.3.4' }];
+result = await deploy({ ...base, customDomain: 'rph.example.com' });
+assert.equal(result.body.customDomain.status, 'manual');
+assert.equal(dnsRecords.length, 1, 'an existing record is never overwritten');
+reset();
+result = await deploy({ ...base, customDomain: 'rph.other.org' });
+assert.equal(result.body.customDomain.status, 'manual');
+assert.match(result.body.customDomain.message, /CNAME 记录：rph\.other\.org → my-rph-x1\.pages\.dev/);
+assert.equal((await deploy({ ...base, customDomain: 'x.pages.dev' })).status, 400);
+console.log('PASS custom domains are attached; DNS is added only in the same account and never overwritten');
 
 const page = await mirrorWorker.fetch(new Request('https://mirror.test/deploy'), env);
 const html = await page.text();
