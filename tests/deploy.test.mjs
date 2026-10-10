@@ -41,7 +41,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (project && method === 'PATCH') return ok({ ...projects.get(project[2]), patched: true });
     if (/\/pages\/projects$/.test(path) && method === 'POST') {
         const name = JSON.parse(init.body).name;
-        if (takenNames.has(name)) return fail(400, 'Subdomain is unavailable. This `*.pages.dev` subdomain is already in use. Select another subdomain.', 8000000);
+        if (takenNames.has(name) || takenNames.has('*')) return fail(400, 'Subdomain is unavailable. This `*.pages.dev` subdomain is already in use. Select another subdomain.', 8000000);
         projects.set(name, { name, subdomain: `${name}-x1.pages.dev` });
         return ok(projects.get(name));
     }
@@ -130,6 +130,16 @@ assert.equal(result.body.ok, true, JSON.stringify(result.body));
 assert.match(result.body.projectName, /^my-rph-[a-z0-9]{4}$/);
 assert.ok(calls.some((call) => call.path.endsWith(`/pages/projects/${result.body.projectName}/deployments`)), 'the deployment goes to the renamed project');
 console.log('PASS a taken pages.dev name is retried with a short suffix');
+
+// Cloudflare 的英文报错配上中文说明，原文附在后面。
+reset();
+takenNames.add('*');
+result = await deploy(base);
+assert.match(result.body.error, /^这个项目名对应的 pages\.dev 网址已经被别人用了.*（Cloudflare 原文：Subdomain is unavailable/);
+reset();
+r2Enabled = false;
+assert.match((await deploy(base)).body.error, /开通.*（Cloudflare 原文：Please enable R2/);
+console.log('PASS Cloudflare errors are explained in Chinese with the original text attached');
 
 // 自定义域名：同帐户里的域名自动加 CNAME；不在帐户里或已有其他记录时只给出手动说明，不覆盖。
 reset();

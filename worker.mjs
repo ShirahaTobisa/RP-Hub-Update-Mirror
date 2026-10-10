@@ -2009,13 +2009,33 @@ class DeployError extends Error {
     }
 }
 
+// Cloudflare 的报错是英文，给不熟悉的人配上中文说明；原文附在后面方便排查。
+const CF_ERROR_HINTS = [
+    [/subdomain is unavailable|subdomain.*already in use/i, '这个项目名对应的 pages.dev 网址已经被别人用了（所有 Cloudflare 用户共用一套网址），请换一个更独特的项目名，比如加上你的名字缩写。'],
+    [/invalid api token|invalid access token|authentication error|unauthorized/i, '令牌无效：可能复制时少了字符、已过期或已被删除。请重新创建令牌，完整复制后再填。'],
+    [/permission|not authorized|forbidden|insufficient/i, '令牌缺少需要的权限：请按右侧「创建令牌」的说明，把列出的权限都加上，帐户资源要选你部署的那个帐户。'],
+    [/please enable r2|r2.*(not enabled|subscri|purchase)|enable.*r2/i, '这个帐户还没开通 R2：到 Cloudflare 后台左侧「R2 对象存储」开通（免费额度内不扣费），然后再部署。'],
+    [/maximum number of projects|project limit/i, '这个帐户的 Pages 项目数量已达上限：到 Cloudflare 后台删掉不用的项目再部署。'],
+    [/rate limit|too many requests/i, '请求太频繁，被 Cloudflare 暂时限制了：等一两分钟再试。'],
+    [/domain.*(already|in use|another project)/i, '这个域名已经绑定在别的 Pages 项目上：先在那个项目的「自定义域」里删掉，再重新部署。'],
+    [/bucket.*(invalid|name)/i, '存储桶名不符合 Cloudflare 的要求：只用小写字母、数字和短横线，3～63 个字符，不能以短横线开头或结尾。'],
+    [/project.*not found/i, '找不到这个 Pages 项目：可能刚被删除，请刷新页面重试。']
+];
+
+function explainCfError(detail, status) {
+    const hint = CF_ERROR_HINTS.find(([pattern]) => pattern.test(detail))?.[1]
+        || (status === 401 || status === 403 ? CF_ERROR_HINTS[2][1] : status >= 500 ? 'Cloudflare 那边暂时出错了，稍等几分钟再试。' : '');
+    return hint ? `${hint}（Cloudflare 原文：${detail}）` : `Cloudflare 返回错误：${detail}`;
+}
+
 async function cfCall(fetchImpl, token, path, init = {}) {
     const response = await fetchImpl(CF_API_BASE + path, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.headers || {}) } });
     const data = await response.json().catch(() => null);
     if (data?.success) return data.result;
     const errors = data?.errors || [];
     const detail = errors.map((item) => item?.message).filter(Boolean).join('；') || `HTTP ${response.status}`;
-    const failure = new DeployError(detail, '', response.status === 401 || response.status === 403 ? 403 : 502);
+    const failure = new DeployError(explainCfError(detail, response.status), '', response.status === 401 || response.status === 403 ? 403 : 502);
+    failure.detail = detail;
     failure.cfStatus = response.status;
     failure.cfCodes = errors.map((item) => item?.code);
     throw failure;
@@ -2083,7 +2103,7 @@ async function attachCustomDomain(fetchImpl, token, account, project, domain, su
             method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: domain })
         });
     } catch (error) {
-        if (!/already|exist/i.test(error.message)) return { name: domain, status: 'failed', message: `域名没能加到项目：${error.message}` };
+        if (!/already|exist/i.test(error.detail || '') || /another project/i.test(error.detail || '')) return { name: domain, status: 'failed', message: `域名没能加到项目：${error.message}` };
     }
     const labels = domain.split('.');
     let zone = null;
@@ -2151,7 +2171,7 @@ async function runDeploy(request, env, options) {
             method: 'POST', headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ name, production_branch: 'main' })
         }).catch((error) => {
-            if (!/subdomain is unavailable|already in use|already exists/i.test(error.message) || attempt >= 3) throw error;
+            if (!/subdomain is unavailable|already in use|already exists/i.test(error.detail || '') || attempt >= 3) throw error;
             return null;
         });
         if (project) projectPath = `/accounts/${account}/pages/projects/${project.name || name}`;
@@ -2166,8 +2186,8 @@ async function runDeploy(request, env, options) {
         await cfCall(fetchImpl, token, `/accounts/${account}/r2/buckets`, {
             method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: bucketName })
         }).catch((error) => {
-            if (/r2|subscri|enabl|activat|purchase/i.test(error.message)) {
-                throw new DeployError(`这个帐户还没开通 R2：到 Cloudflare 后台「R2 对象存储」开通后再部署（${error.message}）。`, 'R2_NOT_ENABLED', 409);
+            if (/enable r2|r2.*(not enabled|subscri|purchase)|activat/i.test(error.detail || '')) {
+                throw new DeployError(explainCfError(error.detail, 409).replace(/^Cloudflare 返回错误：/, '这个帐户还没开通 R2，请到 Cloudflare 后台「R2 对象存储」开通后再部署：'), 'R2_NOT_ENABLED', 409);
             }
             throw error;
         });
