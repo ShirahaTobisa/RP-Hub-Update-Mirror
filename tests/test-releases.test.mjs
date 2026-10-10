@@ -92,6 +92,14 @@ assert.equal(await env.MIRROR_BUCKET.get('test-releases/2026.10.09/RP-Hub-2026.1
 assert.ok(await env.MIRROR_BUCKET.get('test-releases/2026.10.09.2/bundle.json'));
 console.log('PASS unchanged releases reuse stored files; removed releases are cleaned up');
 
+// 发布后在 GitHub 上改了更新说明：附件没变不重新下载，说明照样刷新。
+github = fakeGitHub([{ ...second.entry, body: '改过的更新说明' }], new Map(second.files));
+await syncTestReleases(env, { fetchImpl: github.fetchImpl, now: () => 2500 });
+manifest = JSON.parse(await (await env.MIRROR_BUCKET.get('test-releases/manifest.json')).text());
+assert.equal(manifest.versions[0].notes, '改过的更新说明');
+assert.equal(github.downloads.size, 0);
+console.log('PASS edited release notes are refreshed without downloading the assets again');
+
 // 附件被替换（重新发布同一标签）时重新下载。
 const replaced = release('2026.10.09.2', 5);
 github = fakeGitHub([replaced.entry], new Map(replaced.files));

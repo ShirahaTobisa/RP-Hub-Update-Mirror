@@ -1490,7 +1490,8 @@ export async function syncTestReleases(env, options = {}) {
             continue;
         }
         if (known?.bundle?.assetId === bundleAsset.id && known?.zip?.assetId === zipAsset.id) {
-            versions.push(known);
+            // 附件没变就不重新下载，但标题和更新说明照 GitHub 上的刷新（发布后改了说明也能同步过来）。
+            versions.push({ ...known, name: typeof release.name === 'string' && release.name ? release.name : tag, notes: String(release.body || '').slice(0, 4000) });
             continue;
         }
         try {
