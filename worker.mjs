@@ -1985,7 +1985,243 @@ textarea{min-height:96px;resize:vertical}
 @media(max-width:640px){.wrap{width:calc(100% - 24px)}h1{font-size:22px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stat{padding:10px 12px}.stat span{font-size:12px}.stat b{font-size:14px}.topbar-inner{flex-direction:column;align-items:flex-start;gap:6px;padding:10px 0}.list>li{padding:12px}.pad{padding:14px}}
 `;
 
-const SITE_NAV = [['/', '首页'], ['/workshop/submit', '投稿插件'], ['/admin', '管理']];
+// ---- 一键部署：用用户的 Cloudflare 令牌创建 Pages 项目和 R2 存储桶，部署最新测试版 ----
+// 令牌只在这一次请求里使用，分发站不保存、不写日志；部署时把它作为加密密钥 CF_API_TOKEN 配进用户自己的项目，
+// 之后站内「测试版更新」可以直接一键更新。
+const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
+const DEPLOY_PROJECT_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?$/;
+const DEPLOY_BUCKET_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$/;
+const DEPLOY_ACCOUNT_PATTERN = /^[a-f0-9]{32}$/;
+const DEPLOY_CONTENT_TYPES = {
+    html: 'text/html; charset=utf-8', js: 'text/javascript; charset=utf-8', mjs: 'text/javascript; charset=utf-8',
+    css: 'text/css; charset=utf-8', json: 'application/json; charset=utf-8', svg: 'image/svg+xml', png: 'image/png',
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', ico: 'image/x-icon',
+    woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', txt: 'text/plain; charset=utf-8', md: 'text/markdown; charset=utf-8',
+    wasm: 'application/wasm', webmanifest: 'application/manifest+json'
+};
+
+class DeployError extends Error {
+    constructor(message, code = '', status = 400) {
+        super(message);
+        this.code = code;
+        this.status = status;
+    }
+}
+
+async function cfCall(fetchImpl, token, path, init = {}) {
+    const response = await fetchImpl(CF_API_BASE + path, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.headers || {}) } });
+    const data = await response.json().catch(() => null);
+    if (data?.success) return data.result;
+    const errors = data?.errors || [];
+    const detail = errors.map((item) => item?.message).filter(Boolean).join('；') || `HTTP ${response.status}`;
+    const failure = new DeployError(detail, '', response.status === 401 || response.status === 403 ? 403 : 502);
+    failure.cfStatus = response.status;
+    failure.cfCodes = errors.map((item) => item?.code);
+    throw failure;
+}
+
+async function listDeployAccounts(token, fetchImpl) {
+    try {
+        return (await cfCall(fetchImpl, token, '/accounts?per_page=50')).map((account) => ({ id: account.id, name: account.name || account.id }));
+    } catch (error) {
+        if (error.cfStatus === 401 || error.cfStatus === 403) throw new DeployError('令牌无效或权限不足，请按页面说明创建令牌。', 'TOKEN_INVALID', 403);
+        throw error;
+    }
+}
+
+async function readLatestTestBundle(bucket) {
+    const manifest = await readJsonObject(bucket, TEST_RELEASE_MANIFEST_KEY).then((result) => result.value).catch(() => null);
+    const version = Array.isArray(manifest?.versions) ? manifest.versions[0] : null;
+    if (!version?.tag) throw new DeployError('分发站还没有测试版，暂时不能部署。', 'NO_RELEASE', 503);
+    const object = await bucket.get(`${TEST_RELEASE_PREFIX}/${version.tag}/bundle.json`);
+    if (!object) throw new DeployError('测试版发布包缺失，请稍后再试。', 'NO_RELEASE', 503);
+    const bundle = JSON.parse(await object.text());
+    if (bundle?.format !== 'rph-release-bundle-v1' || typeof bundle.worker !== 'string' || !Array.isArray(bundle.assets)) {
+        throw new DeployError('测试版发布包格式无效。', 'NO_RELEASE', 503);
+    }
+    return bundle;
+}
+
+function deployContentType(path) {
+    const name = path.split('/').pop();
+    return DEPLOY_CONTENT_TYPES[name.includes('.') ? name.split('.').pop().toLowerCase() : ''] || 'application/octet-stream';
+}
+
+// Pages 直传：取上传凭证 → 上传缺失文件 → 登记 → 带外壳代码创建生产部署（与测试版站内一键更新同一流程）。
+async function uploadPagesBundle(fetchImpl, token, account, project, bundle) {
+    const projectPath = `/accounts/${account}/pages/projects/${project}`;
+    const post = (body) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const { jwt } = await cfCall(fetchImpl, token, `${projectPath}/upload-token`);
+    const assets = await Promise.all(bundle.assets.map(async (asset) => {
+        const name = asset.path.split('/').pop();
+        const extension = name.includes('.') ? name.split('.').pop() : '';
+        return { ...asset, hash: (await sha256Bytes(new TextEncoder().encode(asset.base64 + extension))).slice(0, 32) };
+    }));
+    const hashes = assets.map((asset) => asset.hash);
+    const missing = await cfCall(fetchImpl, jwt, '/pages/assets/check-missing', post({ hashes }));
+    const uploads = assets.filter((asset) => missing.includes(asset.hash))
+        .map((asset) => ({ key: asset.hash, value: asset.base64, metadata: { contentType: deployContentType(asset.path) }, base64: true }));
+    if (uploads.length) await cfCall(fetchImpl, jwt, '/pages/assets/upload', post(uploads));
+    await cfCall(fetchImpl, jwt, '/pages/assets/upsert-hashes', post({ hashes }));
+    const workerBundle = new FormData();
+    workerBundle.set('metadata', JSON.stringify({ main_module: '_worker.js' }));
+    workerBundle.set('_worker.js', new File([bundle.worker], '_worker.js', { type: 'application/javascript+module' }));
+    const form = new FormData();
+    form.set('manifest', JSON.stringify(Object.fromEntries(assets.map((asset) => [`/${asset.path}`, asset.hash]))));
+    form.set('branch', 'main');
+    form.set('commit_message', `RP-Hub 测试版 ${bundle.version}（分发站一键部署）`);
+    form.set('_worker.bundle', new File([await new Response(workerBundle).blob()], '_worker.bundle'));
+    return cfCall(fetchImpl, token, `${projectPath}/deployments`, { method: 'POST', body: form });
+}
+
+async function runDeploy(request, env, options) {
+    const fetchImpl = options.fetchImpl;
+    const body = await readJsonRequest(request, 8 * 1024).catch(() => null);
+    const token = String(body?.token || '').trim();
+    const password = String(body?.password || '');
+    const projectName = String(body?.projectName || '').trim().toLowerCase();
+    const bucketName = String(body?.bucketName || '').trim().toLowerCase();
+    if (!token) throw new DeployError('请填写 Cloudflare 令牌。');
+    if (password.length < 6) throw new DeployError('同步密码至少 6 位。');
+    if (!DEPLOY_PROJECT_PATTERN.test(projectName)) throw new DeployError('项目名只能用小写字母、数字和短横线，最多 58 个字符。');
+    if (!DEPLOY_BUCKET_PATTERN.test(bucketName)) throw new DeployError('存储桶名只能用小写字母、数字和短横线，3～63 个字符。');
+    const accounts = await listDeployAccounts(token, fetchImpl);
+    let account = String(body?.accountId || '').trim();
+    if (account && !DEPLOY_ACCOUNT_PATTERN.test(account)) throw new DeployError('帐户 ID 格式不对，应为 32 位字符。');
+    if (!account) {
+        if (accounts.length === 1) account = accounts[0].id;
+        else if (accounts.length > 1) throw new DeployError('令牌能访问多个帐户，请先选择要部署到哪个帐户。', 'CHOOSE_ACCOUNT');
+        else throw new DeployError('令牌查不到帐户：请给令牌加上「帐户设置：读取」权限，或手动填写帐户 ID。', 'NEED_ACCOUNT');
+    } else if (accounts.length && !accounts.some((item) => item.id === account)) {
+        throw new DeployError('令牌没有这个帐户的权限。', 'TOKEN_INVALID', 403);
+    }
+    const bundle = await readLatestTestBundle(env.MIRROR_BUCKET);
+
+    // 项目已存在时不直接覆盖：前端确认后带 overwrite 再来。
+    const projectPath = `/accounts/${account}/pages/projects/${projectName}`;
+    let project = await cfCall(fetchImpl, token, projectPath).catch((error) => {
+        if (error.cfStatus === 404 || error.cfCodes?.includes(8000007)) return null;
+        throw error;
+    });
+    if (project && body?.overwrite !== true) {
+        throw new DeployError(`项目「${projectName}」已存在。继续会用最新测试版覆盖它，并重新设置存储桶绑定和同步密码。`, 'PROJECT_EXISTS', 409);
+    }
+    if (!project) {
+        project = await cfCall(fetchImpl, token, `/accounts/${account}/pages/projects`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name: projectName, production_branch: 'main' })
+        });
+    }
+    const bucketPath = `/accounts/${account}/r2/buckets/${bucketName}`;
+    const existingBucket = await cfCall(fetchImpl, token, bucketPath).catch((error) => {
+        if (error.cfStatus === 404 || error.cfCodes?.includes(10006)) return null;
+        throw error;
+    });
+    if (!existingBucket) {
+        await cfCall(fetchImpl, token, `/accounts/${account}/r2/buckets`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: bucketName })
+        }).catch((error) => {
+            if (/r2|subscri|enabl|activat|purchase/i.test(error.message)) {
+                throw new DeployError(`这个帐户还没开通 R2：到 Cloudflare 后台「R2 对象存储」开通后再部署（${error.message}）。`, 'R2_NOT_ENABLED', 409);
+            }
+            throw error;
+        });
+    }
+    await cfCall(fetchImpl, token, projectPath, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+            deployment_configs: {
+                production: {
+                    r2_buckets: { RP_SYNC_R2: { name: bucketName } },
+                    env_vars: {
+                        RP_SYNC_PASSWORD: { type: 'secret_text', value: password },
+                        CF_API_TOKEN: { type: 'secret_text', value: token },
+                        CF_ACCOUNT_ID: { type: 'plain_text', value: account }
+                    }
+                }
+            }
+        })
+    });
+    const deployment = await uploadPagesBundle(fetchImpl, token, account, projectName, bundle);
+    return {
+        ok: true,
+        version: bundle.version,
+        url: `https://${project.subdomain || `${projectName}.pages.dev`}`,
+        deploymentUrl: deployment.url || '',
+        bucketCreated: !existingBucket
+    };
+}
+
+async function handleDeployApi(request, env, options, action) {
+    try {
+        if (action === 'accounts') {
+            const body = await readJsonRequest(request, 4 * 1024).catch(() => null);
+            const token = String(body?.token || '').trim();
+            if (!token) throw new DeployError('请填写 Cloudflare 令牌。');
+            return jsonResponse({ ok: true, accounts: await listDeployAccounts(token, options.fetchImpl) });
+        }
+        return jsonResponse(await runDeploy(request, env, options));
+    } catch (error) {
+        const known = error instanceof DeployError;
+        return jsonResponse({ ok: false, code: known ? error.code : '', error: known ? error.message : `部署失败：${safeErrorMessage(error, env)}` }, { status: known ? error.status : 500 });
+    }
+}
+
+const DEPLOY_SCRIPT = String.raw`
+const byId=(id)=>document.getElementById(id);
+const form=byId('deployForm'),status=byId('deployStatus'),accountField=byId('accountField'),accountSelect=byId('account'),submit=byId('deploy');
+let overwrite=false;
+function say(text,kind){status.textContent=text;status.className='notice'+(kind?' '+kind:'');status.hidden=!text;}
+async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const value=await response.json().catch(()=>({ok:false,error:'HTTP '+response.status}));return value;}
+function payload(){return{token:byId('token').value.trim(),accountId:accountField.hidden?'':accountSelect.value,projectName:byId('project').value.trim(),bucketName:byId('bucket').value.trim(),password:byId('password').value,overwrite};}
+byId('token').addEventListener('change',()=>{accountField.hidden=true;accountSelect.innerHTML='';overwrite=false;});
+byId('project').addEventListener('input',()=>{overwrite=false;});
+form.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;say('正在部署，约需半分钟，请不要关闭页面…');
+try{const result=await post('/api/deploy',payload());
+if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;form.hidden=true;byId('done').hidden=false;return;}
+if(result.code==='CHOOSE_ACCOUNT'||result.code==='NEED_ACCOUNT'){const list=await post('/api/deploy/accounts',{token:byId('token').value.trim()});accountSelect.innerHTML='';(list.accounts||[]).forEach((item)=>{const option=document.createElement('option');option.value=item.id;option.textContent=item.name+'（'+item.id.slice(0,8)+'…）';accountSelect.appendChild(option);});if(result.code==='NEED_ACCOUNT'){byId('accountManual').hidden=false;}accountField.hidden=false;say(result.error,'warn');return;}
+if(result.code==='PROJECT_EXISTS'){if(confirm(result.error+'\n\n确定继续吗？')){overwrite=true;submit.disabled=false;form.requestSubmit();return;}say('已取消。换个项目名再部署，或确认覆盖。','warn');return;}
+say(result.error||'部署失败','error');}catch(error){say('部署失败：'+error.message,'error');}finally{submit.disabled=false;}});
+byId('accountManualInput').addEventListener('input',(event)=>{const value=event.target.value.trim();accountSelect.innerHTML='';if(value){const option=document.createElement('option');option.value=value;option.textContent=value;accountSelect.appendChild(option);}});
+`;
+
+function renderDeployHtml() {
+    const main = `<div class="submit-layout">
+<section>
+<h1>一键部署</h1>
+<p class="lead">在你自己的 Cloudflare 帐户里创建 RP-Hub 测试版站点：自动建 Pages 项目和 R2 存储桶、绑定、设置同步密码并部署最新测试版。免费计划即可。</p>
+<form id="deployForm" class="card pad form" style="margin-top:20px">
+<label class="field">Cloudflare 令牌<small>按「创建令牌」里的说明创建；分发站只在这次部署中使用，不保存。</small><input id="token" type="password" autocomplete="off" required></label>
+<div id="accountField" class="field" hidden><span>部署到哪个帐户</span><select id="account"></select><label id="accountManual" class="field" hidden>帐户 ID<small>后台网址 dash.cloudflare.com/ 后面那串 32 位字符</small><input id="accountManualInput" maxlength="32"></label></div>
+<label class="field">项目名<small>会成为网址 <code>项目名.pages.dev</code>；小写字母、数字和短横线</small><input id="project" maxlength="58" required placeholder="my-rph"></label>
+<label class="field">存储桶名<small>云同步、图片都存在这里；已有同名桶会直接使用</small><input id="bucket" maxlength="63" required value="rph-data"></label>
+<label class="field">同步密码<small>至少 6 位；以后在站点里同步、管理图片都要用</small><input id="password" type="password" autocomplete="new-password" minlength="6" required></label>
+<p id="deployStatus" class="notice" hidden></p>
+<div class="actions"><button id="deploy" class="btn primary" type="submit">部署</button></div>
+</form>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>部署完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>。第一次打开可能要等半分钟生效。</p><p class="notes">之后在站点「同步 → 测试版更新」里就能一键更新，不需要再来这里。</p></div>
+</section>
+<aside class="card pad side">
+<h2>创建令牌</h2>
+<ol>
+<li>打开 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">API 令牌</a> →「创建令牌」→「创建自定义令牌」。</li>
+<li>权限添加三项：<br>帐户 → Cloudflare Pages → 编辑<br>帐户 → Workers R2 存储 → 编辑<br>帐户 → 帐户设置 → 读取</li>
+<li>帐户资源选你要部署的帐户，创建后复制令牌。</li>
+</ol>
+<h2>这个令牌会被怎样使用</h2>
+<ul>
+<li>分发站只在这次部署中用它调用 Cloudflare 接口，不保存、不写日志。</li>
+<li>部署时它会作为加密密钥 <code>CF_API_TOKEN</code> 存进你自己的 Pages 项目，站点以后用它一键更新。不想要这个功能，可以在项目设置里删掉它。</li>
+<li>令牌只发给你自己，不要发给别人或贴到群里。</li>
+</ul>
+<p class="small muted">想手动部署，见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/docs/INSTALL.md">安装说明</a>。</p>
+</aside>
+</div>`;
+    const css = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:6px 0}select{width:100%}@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
+    return renderShell({ title: '一键部署', active: '/deploy', main, css, script: DEPLOY_SCRIPT });
+}
+
+const SITE_NAV = [['/', '首页'], ['/deploy', '一键部署'], ['/workshop/submit', '投稿插件'], ['/admin', '管理']];
 
 function renderShell({ title, active, main, css = '', script = '' }) {
     const nav = SITE_NAV.map(([href, label]) => `<a href="${href}"${href === active ? ' aria-current="page"' : ''}>${label}</a>`).join('');
@@ -2493,6 +2729,21 @@ async function handleRequest(request, env, options = {}) {
         } catch (error) {
             return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
         }
+    }
+    if (request.method === 'GET' && url.pathname === '/deploy') {
+        return new Response(renderDeployHtml(), {
+            headers: {
+                'cache-control': 'no-store',
+                'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                'content-type': 'text/html; charset=utf-8',
+                'referrer-policy': 'no-referrer',
+                'x-content-type-options': 'nosniff',
+                'x-frame-options': 'DENY'
+            }
+        });
+    }
+    if (request.method === 'POST' && (url.pathname === '/api/deploy' || url.pathname === '/api/deploy/accounts')) {
+        return handleDeployApi(request, env, runtimeOptions, url.pathname === '/api/deploy' ? 'deploy' : 'accounts');
     }
     if (request.method === 'GET' && url.pathname === '/workshop/submit') {
         return new Response(renderWorkshopSubmitHtml(), {
