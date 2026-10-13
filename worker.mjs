@@ -2131,6 +2131,39 @@ async function attachCustomDomain(fetchImpl, token, account, project, domain, su
     }
 }
 
+// 令牌只能访问一个帐户就用它；多个时让用户选，查不到时让用户手动填。
+async function resolveDeployAccount(fetchImpl, token, accountId) {
+    const accounts = await listDeployAccounts(token, fetchImpl);
+    const account = String(accountId || '').trim();
+    if (account && !DEPLOY_ACCOUNT_PATTERN.test(account)) throw new DeployError('帐户 ID 格式不对，应为 32 位字符。');
+    if (!account) {
+        if (accounts.length === 1) return accounts[0].id;
+        if (accounts.length > 1) throw new DeployError('令牌能访问多个帐户，请先选择用哪个帐户。', 'CHOOSE_ACCOUNT');
+        throw new DeployError('令牌查不到帐户：请给令牌加上「帐户设置：读取」权限，或手动填写帐户 ID。', 'NEED_ACCOUNT');
+    }
+    if (accounts.length && !accounts.some((item) => item.id === account)) throw new DeployError('令牌没有这个帐户的权限。', 'TOKEN_INVALID', 403);
+    return account;
+}
+
+// 绑定存储桶、设置同步密码；令牌作为加密变量存进项目，站点以后用它一键更新。
+function configureProject(fetchImpl, token, account, projectPath, bucketName, password) {
+    return cfCall(fetchImpl, token, projectPath, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+            deployment_configs: {
+                production: {
+                    r2_buckets: { RP_SYNC_R2: { name: bucketName } },
+                    env_vars: {
+                        RP_SYNC_PASSWORD: { type: 'secret_text', value: password },
+                        CF_API_TOKEN: { type: 'secret_text', value: token },
+                        CF_ACCOUNT_ID: { type: 'plain_text', value: account }
+                    }
+                }
+            }
+        })
+    });
+}
+
 async function runDeploy(request, env, options) {
     const fetchImpl = options.fetchImpl;
     const body = await readJsonRequest(request, 8 * 1024).catch(() => null);
@@ -2144,16 +2177,7 @@ async function runDeploy(request, env, options) {
     if (!DEPLOY_BUCKET_PATTERN.test(bucketName)) throw new DeployError('存储桶名只能用小写字母、数字和短横线，3～63 个字符。');
     const customDomain = String(body?.customDomain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     if (customDomain && (!DEPLOY_DOMAIN_PATTERN.test(customDomain) || customDomain.endsWith('.pages.dev'))) throw new DeployError('自定义域名格式不对，例如 rph.example.com。');
-    const accounts = await listDeployAccounts(token, fetchImpl);
-    let account = String(body?.accountId || '').trim();
-    if (account && !DEPLOY_ACCOUNT_PATTERN.test(account)) throw new DeployError('帐户 ID 格式不对，应为 32 位字符。');
-    if (!account) {
-        if (accounts.length === 1) account = accounts[0].id;
-        else if (accounts.length > 1) throw new DeployError('令牌能访问多个帐户，请先选择要部署到哪个帐户。', 'CHOOSE_ACCOUNT');
-        else throw new DeployError('令牌查不到帐户：请给令牌加上「帐户设置：读取」权限，或手动填写帐户 ID。', 'NEED_ACCOUNT');
-    } else if (accounts.length && !accounts.some((item) => item.id === account)) {
-        throw new DeployError('令牌没有这个帐户的权限。', 'TOKEN_INVALID', 403);
-    }
+    const account = await resolveDeployAccount(fetchImpl, token, body?.accountId);
     const bundle = await readLatestTestBundle(env.MIRROR_BUCKET);
 
     // 项目已存在时不直接覆盖：前端确认后带 overwrite 再来。
@@ -2193,21 +2217,7 @@ async function runDeploy(request, env, options) {
             throw error;
         });
     }
-    await cfCall(fetchImpl, token, projectPath, {
-        method: 'PATCH', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-            deployment_configs: {
-                production: {
-                    r2_buckets: { RP_SYNC_R2: { name: bucketName } },
-                    env_vars: {
-                        RP_SYNC_PASSWORD: { type: 'secret_text', value: password },
-                        CF_API_TOKEN: { type: 'secret_text', value: token },
-                        CF_ACCOUNT_ID: { type: 'plain_text', value: account }
-                    }
-                }
-            }
-        })
-    });
+    await configureProject(fetchImpl, token, account, projectPath, bucketName, password);
     const deployment = await uploadPagesBundle(fetchImpl, token, account, finalName, bundle);
     const subdomain = project.subdomain || `${finalName}.pages.dev`;
     const domain = customDomain ? await attachCustomDomain(fetchImpl, token, account, finalName, customDomain, subdomain) : null;
@@ -2222,6 +2232,53 @@ async function runDeploy(request, env, options) {
     };
 }
 
+// ---- 从魔改版迁移：把已有的魔改版站点（cy-2-u/rp）换成最新测试版 ----
+// 两边用同样的绑定（RP_SYNC_R2 存储桶、RP_SYNC_PASSWORD 同步密码），项目、网址、域名、存储桶都不动；
+// 云端数据留在桶里，测试版里点「下载」时导入。
+const FORK_ROOT_FORMAT = 'rp-sync-manifest-root-v1';
+const MIGRATE_SITE_LIMIT = 30;
+
+// 站点云端同步的总清单：认出魔改版和测试版，读不到就当没有。
+async function readSyncRoot(fetchImpl, token, account, bucketName) {
+    const response = await fetchImpl(`${CF_API_BASE}/accounts/${account}/r2/buckets/${bucketName}/objects/rp-sync/main/manifest.json`, {
+        headers: { authorization: `Bearer ${token}` }
+    }).catch(() => null);
+    return response?.ok ? response.json().catch(() => null) : null;
+}
+
+function describeSite(project, root = null) {
+    const ours = /RP-Hub 测试版/.test(project.latest_deployment?.deployment_trigger?.metadata?.commit_message || '') || Boolean(root?.mode);
+    const kind = ours ? 'test' : root?.format === FORK_ROOT_FORMAT ? 'fork' : 'unknown';
+    const domain = (project.domains || []).find((name) => !name.endsWith('.pages.dev')) || project.subdomain || `${project.name}.pages.dev`;
+    return { name: project.name, url: `https://${domain}`, kind, syncedAt: kind === 'fork' ? Number(root.updatedAt) || 0 : 0 };
+}
+
+async function listMigrationSites(fetchImpl, token, account) {
+    const projects = [];
+    for (let page = 1; page <= 5; page += 1) {
+        const items = await cfCall(fetchImpl, token, `/accounts/${account}/pages/projects?page=${page}`);
+        projects.push(...items.filter((project) => project.deployment_configs?.production?.r2_buckets?.RP_SYNC_R2?.name));
+        if (!items.length) break;
+    }
+    return Promise.all(projects.slice(0, MIGRATE_SITE_LIMIT).map(async (project) => describeSite(project,
+        await readSyncRoot(fetchImpl, token, account, project.deployment_configs.production.r2_buckets.RP_SYNC_R2.name))));
+}
+
+async function runMigration(fetchImpl, env, token, account, body) {
+    const projectName = String(body?.projectName || '').trim().toLowerCase();
+    const password = String(body?.password || '');
+    if (!DEPLOY_PROJECT_PATTERN.test(projectName)) throw new DeployError('请先选择要迁移的站点。');
+    if (password.length < 6) throw new DeployError('同步密码至少 6 位。');
+    const projectPath = `/accounts/${account}/pages/projects/${projectName}`;
+    const project = await cfCall(fetchImpl, token, projectPath);
+    const bucketName = project.deployment_configs?.production?.r2_buckets?.RP_SYNC_R2?.name;
+    if (!bucketName) throw new DeployError('这个项目没有绑定 RP_SYNC_R2 存储桶，不是魔改版站点。');
+    const bundle = await readLatestTestBundle(env.MIRROR_BUCKET);
+    await configureProject(fetchImpl, token, account, projectPath, bucketName, password);
+    const deployment = await uploadPagesBundle(fetchImpl, token, account, project.name, bundle);
+    return { ok: true, version: bundle.version, projectName: project.name, url: describeSite(project).url, deploymentUrl: deployment.url || '' };
+}
+
 async function handleDeployApi(request, env, options, action) {
     try {
         if (action === 'accounts') {
@@ -2230,6 +2287,15 @@ async function handleDeployApi(request, env, options, action) {
             if (!token) throw new DeployError('请填写 Cloudflare 令牌。');
             return jsonResponse({ ok: true, accounts: await listDeployAccounts(token, options.fetchImpl) });
         }
+        if (action === 'sites' || action === 'migrate') {
+            const body = await readJsonRequest(request, 8 * 1024).catch(() => null);
+            const token = String(body?.token || '').trim();
+            if (!token) throw new DeployError('请填写 Cloudflare 令牌。');
+            const account = await resolveDeployAccount(options.fetchImpl, token, body?.accountId);
+            return jsonResponse(action === 'sites'
+                ? { ok: true, sites: await listMigrationSites(options.fetchImpl, token, account) }
+                : await runMigration(options.fetchImpl, env, token, account, body));
+        }
         return jsonResponse(await runDeploy(request, env, options));
     } catch (error) {
         const known = error instanceof DeployError;
@@ -2237,37 +2303,73 @@ async function handleDeployApi(request, env, options, action) {
     }
 }
 
-const DEPLOY_SCRIPT = String.raw`
+// 部署页和迁移页共用：令牌和帐户选择、提示、请求。
+const DEPLOY_COMMON_SCRIPT = String.raw`
 const byId=(id)=>document.getElementById(id);
-const form=byId('deployForm'),status=byId('deployStatus'),accountField=byId('accountField'),accountSelect=byId('account'),submit=byId('deploy');
-let overwrite=false;
+const status=byId('status'),accountField=byId('accountField'),accountSelect=byId('account');
 function say(text,kind){status.textContent=text;status.className='notice'+(kind?' '+kind:'');status.hidden=!text;}
 async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const value=await response.json().catch(()=>({ok:false,error:'HTTP '+response.status}));return value;}
-function payload(){return{token:byId('token').value.trim(),accountId:accountField.hidden?'':accountSelect.value,projectName:byId('project').value.trim(),customDomain:byId('domain').value.trim(),bucketName:byId('bucket').value.trim(),password:byId('password').value,overwrite};}
-byId('token').addEventListener('change',()=>{accountField.hidden=true;accountSelect.innerHTML='';overwrite=false;});
+function credentials(){return{token:byId('token').value.trim(),accountId:accountField.hidden?'':accountSelect.value};}
+async function askAccount(result){if(result.code!=='CHOOSE_ACCOUNT'&&result.code!=='NEED_ACCOUNT')return false;const list=await post('/api/deploy/accounts',{token:byId('token').value.trim()});accountSelect.innerHTML='';(list.accounts||[]).forEach((item)=>{const option=document.createElement('option');option.value=item.id;option.textContent=item.name+'（'+item.id.slice(0,8)+'…）';accountSelect.appendChild(option);});if(result.code==='NEED_ACCOUNT'){byId('accountManual').hidden=false;}accountField.hidden=false;say(result.error,'warn');return true;}
+byId('token').addEventListener('change',()=>{accountField.hidden=true;accountSelect.innerHTML='';});
+byId('accountManualInput').addEventListener('input',(event)=>{const value=event.target.value.trim();accountSelect.innerHTML='';if(value){const option=document.createElement('option');option.value=value;option.textContent=value;accountSelect.appendChild(option);}});
+`;
+
+const DEPLOY_SCRIPT = DEPLOY_COMMON_SCRIPT + String.raw`
+const form=byId('deployForm'),submit=byId('deploy');
+let overwrite=false;
+function payload(){return{...credentials(),projectName:byId('project').value.trim(),customDomain:byId('domain').value.trim(),bucketName:byId('bucket').value.trim(),password:byId('password').value,overwrite};}
+byId('token').addEventListener('change',()=>{overwrite=false;});
 byId('project').addEventListener('input',()=>{overwrite=false;});
 form.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;say('正在部署，约需半分钟，请不要关闭页面…');
 try{const result=await post('/api/deploy',payload());
 if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;byId('doneDomain').textContent=result.customDomain?('自定义域名 '+result.customDomain.name+'：'+result.customDomain.message):'';byId('doneDomain').hidden=!result.customDomain;byId('doneName').textContent=result.projectName;form.hidden=true;byId('done').hidden=false;return;}
-if(result.code==='CHOOSE_ACCOUNT'||result.code==='NEED_ACCOUNT'){const list=await post('/api/deploy/accounts',{token:byId('token').value.trim()});accountSelect.innerHTML='';(list.accounts||[]).forEach((item)=>{const option=document.createElement('option');option.value=item.id;option.textContent=item.name+'（'+item.id.slice(0,8)+'…）';accountSelect.appendChild(option);});if(result.code==='NEED_ACCOUNT'){byId('accountManual').hidden=false;}accountField.hidden=false;say(result.error,'warn');return;}
+if(await askAccount(result))return;
 if(result.code==='PROJECT_EXISTS'){if(confirm(result.error+'\n\n确定继续吗？')){overwrite=true;submit.disabled=false;form.requestSubmit();return;}say('已取消。换个项目名再部署，或确认覆盖。','warn');return;}
 say(result.error||'部署失败','error');}catch(error){say('部署失败：'+error.message,'error');}finally{submit.disabled=false;}});
-byId('accountManualInput').addEventListener('input',(event)=>{const value=event.target.value.trim();accountSelect.innerHTML='';if(value){const option=document.createElement('option');option.value=value;option.textContent=value;accountSelect.appendChild(option);}});
 `;
+
+const MIGRATE_SCRIPT = DEPLOY_COMMON_SCRIPT + String.raw`
+const form=byId('migrateForm'),submit=byId('migrate'),find=byId('find'),list=byId('sites');
+const KINDS={fork:['魔改版','ok'],test:['已经是测试版','primary'],unknown:['没找到云端数据','warn']};
+function describe(site){if(site.kind==='fork')return '云端最后同步：'+(site.syncedAt?new Date(site.syncedAt).toLocaleString('zh-CN'):'未知');if(site.kind==='test')return '不用迁移，在站点「同步 → 测试版更新」里更新就行';return '可能还没同步过；迁移后各设备只有自己本机的数据';}
+function render(sites){list.innerHTML='';byId('pick').hidden=!sites.length;if(!sites.length){say('这个帐户里没有绑定了存储桶的 Pages 站点。','warn');return;}say('');
+sites.forEach((site)=>{const label=document.createElement('label');label.className='site';const radio=document.createElement('input');radio.type='radio';radio.name='site';radio.value=site.name;radio.disabled=site.kind==='test';const text=document.createElement('span');const name=document.createElement('b');name.textContent=site.name+' ';const badge=document.createElement('span');badge.className='badge '+KINDS[site.kind][1];badge.textContent=KINDS[site.kind][0];const detail=document.createElement('small');detail.textContent=site.url+'　'+describe(site);text.append(name,badge,detail);label.append(radio,text);list.appendChild(label);});
+const forks=sites.filter((site)=>site.kind==='fork');if(forks.length===1)list.querySelector('input[value="'+forks[0].name+'"]').checked=true;}
+find.addEventListener('click',async()=>{if(!byId('token').value.trim()){say('请先填写令牌。','warn');return;}find.disabled=true;say('正在查找…');try{const result=await post('/api/deploy/sites',credentials());if(result.ok){render(result.sites);return;}if(await askAccount(result))return;say(result.error||'查找失败','error');}catch(error){say('查找失败：'+error.message,'error');}finally{find.disabled=false;}});
+form.addEventListener('submit',async(event)=>{event.preventDefault();if(byId('pick').hidden){find.click();return;}const site=form.querySelector('input[name="site"]:checked');
+if(!site){say('请先选择要迁移的站点。','warn');return;}if(byId('password').value.length<6){say('同步密码至少 6 位。','warn');return;}
+if(!confirm('把「'+site.value+'」换成测试版？\n\n网址、域名、存储桶都不变，云端数据不会删除。迁移后每台设备在「同步」里点一次「下载」导入数据。'))return;
+submit.disabled=true;say('正在迁移，约需半分钟，请不要关闭页面…');
+try{const result=await post('/api/deploy/migrate',{...credentials(),projectName:site.value,password:byId('password').value});
+if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;form.hidden=true;byId('done').hidden=false;return;}
+if(await askAccount(result))return;say(result.error||'迁移失败','error');}catch(error){say('迁移失败：'+error.message,'error');}finally{submit.disabled=false;}});
+`;
+
+const DEPLOY_TOKEN_FIELDS = `<label class="field">Cloudflare 令牌<small>按「创建令牌」里的说明创建；分发站只在这次操作中使用，不保存。</small><input id="token" type="password" autocomplete="off" required></label>
+<div id="accountField" class="field" hidden><span>用哪个帐户</span><select id="account"></select><label id="accountManual" class="field" hidden>帐户 ID<small>后台网址 dash.cloudflare.com/ 后面那串 32 位字符</small><input id="accountManualInput" maxlength="32"></label></div>`;
+const DEPLOY_TOKEN_STEPS = `<li>打开 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">API 令牌</a> →「创建令牌」→「创建自定义令牌」。</li>
+<li>权限添加三项：<br>帐户 → Cloudflare Pages → 编辑<br>帐户 → Workers R2 存储 → 编辑<br>帐户 → 帐户设置 → 读取</li>`;
+const DEPLOY_TOKEN_USAGE = `<h2>这个令牌会被怎样使用</h2>
+<ul>
+<li>分发站只在这次操作中用它调用 Cloudflare 接口，不保存、不写日志。</li>
+<li>它会作为加密密钥 <code>CF_API_TOKEN</code> 存进你自己的 Pages 项目，站点以后用它一键更新。不想要这个功能，可以在项目设置里删掉它。</li>
+<li>令牌只发给你自己，不要发给别人或贴到群里。</li>
+</ul>`;
+const DEPLOY_PAGE_CSS = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:6px 0}select{width:100%}@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
 
 function renderDeployHtml() {
     const main = `<div class="submit-layout">
 <section>
 <h1>一键部署</h1>
-<p class="lead">在你自己的 Cloudflare 帐户里创建 RP-Hub 测试版站点：自动建 Pages 项目和 R2 存储桶、绑定、设置同步密码并部署最新测试版。免费计划即可。</p>
+<p class="lead">在你自己的 Cloudflare 帐户里创建 RP-Hub 测试版站点：自动建 Pages 项目和 R2 存储桶、绑定、设置同步密码并部署最新测试版。免费计划即可。已经在用魔改版？去 <a href="/migrate">魔改版迁移</a>。</p>
 <form id="deployForm" class="card pad form" style="margin-top:20px">
-<label class="field">Cloudflare 令牌<small>按「创建令牌」里的说明创建；分发站只在这次部署中使用，不保存。</small><input id="token" type="password" autocomplete="off" required></label>
-<div id="accountField" class="field" hidden><span>部署到哪个帐户</span><select id="account"></select><label id="accountManual" class="field" hidden>帐户 ID<small>后台网址 dash.cloudflare.com/ 后面那串 32 位字符</small><input id="accountManualInput" maxlength="32"></label></div>
+${DEPLOY_TOKEN_FIELDS}
 <label class="field">项目名<small>会成为网址 <code>项目名.pages.dev</code>；小写字母、数字和短横线；被别人用过会自动加后缀</small><input id="project" maxlength="58" required placeholder="my-rph"></label>
 <label class="field">自定义域名<small>选填，例如 rph.example.com；不填就用 pages.dev 网址</small><input id="domain" maxlength="253" placeholder="rph.example.com"></label>
 <label class="field">存储桶名<small>云同步、图片都存在这里；已有同名桶会直接使用</small><input id="bucket" maxlength="63" required value="rph-data"></label>
 <label class="field">同步密码<small>至少 6 位；以后在站点里同步、管理图片都要用</small><input id="password" type="password" autocomplete="new-password" minlength="6" required></label>
-<p id="deployStatus" class="notice" hidden></p>
+<p id="status" class="notice" hidden></p>
 <div class="actions"><button id="deploy" class="btn primary" type="submit">部署</button></div>
 </form>
 <div id="done" class="card pad" hidden style="margin-top:20px"><h2>部署完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>。第一次打开可能要等半分钟生效。</p><p class="notes">项目名：<code id="doneName"></code>（原名被占用时会自动加后缀）。</p><p id="doneDomain" class="notes" hidden></p><p class="notes">之后在站点「同步 → 测试版更新」里就能一键更新，不需要再来这里。</p></div>
@@ -2275,25 +2377,54 @@ function renderDeployHtml() {
 <aside class="card pad side">
 <h2>创建令牌</h2>
 <ol>
-<li>打开 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">API 令牌</a> →「创建令牌」→「创建自定义令牌」。</li>
-<li>权限添加三项：<br>帐户 → Cloudflare Pages → 编辑<br>帐户 → Workers R2 存储 → 编辑<br>帐户 → 帐户设置 → 读取</li>
+${DEPLOY_TOKEN_STEPS}
 <li>要用自定义域名，再加两项：区域 → 区域 → 读取、区域 → DNS → 编辑（区域资源选你的域名）。不加也能部署，只是要自己去加 DNS 记录。</li>
 <li>帐户资源选你要部署的帐户，创建后复制令牌。</li>
 </ol>
-<h2>这个令牌会被怎样使用</h2>
-<ul>
-<li>分发站只在这次部署中用它调用 Cloudflare 接口，不保存、不写日志。</li>
-<li>部署时它会作为加密密钥 <code>CF_API_TOKEN</code> 存进你自己的 Pages 项目，站点以后用它一键更新。不想要这个功能，可以在项目设置里删掉它。</li>
-<li>令牌只发给你自己，不要发给别人或贴到群里。</li>
-</ul>
+${DEPLOY_TOKEN_USAGE}
 <p class="small muted">想手动部署，见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/docs/INSTALL.md">安装说明</a>。</p>
 </aside>
 </div>`;
-    const css = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:6px 0}select{width:100%}@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
-    return renderShell({ title: '一键部署', active: '/deploy', main, css, script: DEPLOY_SCRIPT });
+    return renderShell({ title: '一键部署', active: '/deploy', main, css: DEPLOY_PAGE_CSS, script: DEPLOY_SCRIPT });
 }
 
-const SITE_NAV = [['/', '首页'], ['/deploy', '一键部署'], ['/workshop/submit', '投稿插件'], ['/admin', '管理']];
+function renderMigrateHtml() {
+    const main = `<div class="submit-layout">
+<section>
+<h1>从魔改版迁移</h1>
+<p class="lead">已经在用魔改版（cy-2-u/rp）的站点，可以一键换成测试版：网址、自定义域名、存储桶都不变，云端数据不会删除。</p>
+<form id="migrateForm" class="card pad form" style="margin-top:20px">
+${DEPLOY_TOKEN_FIELDS}
+<div class="actions"><button id="find" class="btn" type="button">查找我的站点</button></div>
+<div id="pick" class="form" hidden>
+<div class="field"><span>要迁移的站点</span><div id="sites" class="sites"></div></div>
+<label class="field">同步密码<small>填魔改版现在用的密码就行，也可以换个新的（至少 6 位）；换了的话，各设备同步时会让你重新输入</small><input id="password" type="password" autocomplete="new-password"></label>
+<div class="actions"><button id="migrate" class="btn primary" type="submit">迁移到测试版</button></div>
+</div>
+<p id="status" class="notice" hidden></p>
+</form>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>迁移完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>，第一次打开可能要等半分钟生效。接下来：</p>
+<ol class="notes"><li>每台设备打开站点，在「同步」里点一次「下载」，把魔改版的云端数据导进来，导完页面会自动刷新。</li><li>数据都对了，以后照常「上传」「下载」。第一次上传时还会再提醒一次。</li><li>以后在站点「同步 → 测试版更新」里就能一键更新。</li></ol></div>
+</section>
+<aside class="card pad side">
+<h2>迁移前</h2>
+<ul>
+<li>先在魔改版里上传一次，让云端是最新的：迁移后各设备导入的是云端的数据。</li>
+<li>在测试版里第一次「上传」之前，随时可以用魔改版的部署器换回去，数据都还在。</li>
+</ul>
+<h2>创建令牌</h2>
+<ol>
+${DEPLOY_TOKEN_STEPS}
+<li>帐户资源选站点所在的帐户，创建后复制令牌。和一键部署用的是同一种令牌。</li>
+</ol>
+${DEPLOY_TOKEN_USAGE}
+</aside>
+</div>`;
+    const css = '.sites{display:grid;gap:8px}.site{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;cursor:pointer}.site input{width:auto;flex:none;margin:4px 0 0}.site>span{flex:1;min-width:0}.site small{display:block;margin-top:2px;color:var(--muted);overflow-wrap:anywhere}';
+    return renderShell({ title: '魔改版迁移', active: '/migrate', main, css: DEPLOY_PAGE_CSS + css, script: MIGRATE_SCRIPT });
+}
+
+const SITE_NAV = [['/', '首页'], ['/deploy', '一键部署'], ['/migrate', '魔改版迁移'], ['/workshop/submit', '投稿插件'], ['/admin', '管理']];
 
 function renderShell({ title, active, main, css = '', script = '' }) {
     const nav = SITE_NAV.map(([href, label]) => `<a href="${href}"${href === active ? ' aria-current="page"' : ''}>${label}</a>`).join('');
@@ -2802,8 +2933,8 @@ async function handleRequest(request, env, options = {}) {
             return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
         }
     }
-    if (request.method === 'GET' && url.pathname === '/deploy') {
-        return new Response(renderDeployHtml(), {
+    if (request.method === 'GET' && (url.pathname === '/deploy' || url.pathname === '/migrate')) {
+        return new Response(url.pathname === '/deploy' ? renderDeployHtml() : renderMigrateHtml(), {
             headers: {
                 'cache-control': 'no-store',
                 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
@@ -2814,8 +2945,8 @@ async function handleRequest(request, env, options = {}) {
             }
         });
     }
-    if (request.method === 'POST' && (url.pathname === '/api/deploy' || url.pathname === '/api/deploy/accounts')) {
-        return handleDeployApi(request, env, runtimeOptions, url.pathname === '/api/deploy' ? 'deploy' : 'accounts');
+    if (request.method === 'POST' && ['/api/deploy', '/api/deploy/accounts', '/api/deploy/sites', '/api/deploy/migrate'].includes(url.pathname)) {
+        return handleDeployApi(request, env, runtimeOptions, url.pathname.split('/')[3] || 'deploy');
     }
     if (request.method === 'GET' && url.pathname === '/workshop/submit') {
         return new Response(renderWorkshopSubmitHtml(), {

@@ -14,7 +14,7 @@ bucket.seedJson('test-releases/2026.10.10.6/bundle.json', {
 });
 const env = { MIRROR_BUCKET: bucket };
 
-let accounts, projects, buckets, r2Enabled, takenNames, zones, dnsRecords;
+let accounts, projects, buckets, r2Enabled, takenNames, zones, dnsRecords, objects;
 const calls = [];
 const ok = (result) => Response.json({ success: true, result });
 const fail = (status, message, code = 1000) => Response.json({ success: false, errors: [{ code, message }] }, { status });
@@ -26,6 +26,7 @@ function reset() {
     takenNames = new Set();
     zones = [];
     dnsRecords = [];
+    objects = new Map();
     calls.length = 0;
 }
 globalThis.fetch = async (input, init = {}) => {
@@ -36,6 +37,9 @@ globalThis.fetch = async (input, init = {}) => {
     calls.push({ method, path, auth: init.headers?.authorization, body: typeof init.body === 'string' ? JSON.parse(init.body) : init.body });
     if (init.headers?.authorization === 'Bearer bad') return fail(401, 'Invalid API Token');
     if (path === '/accounts') return ok(accounts);
+    if (/^\/accounts\/\w+\/pages\/projects$/.test(path) && method === 'GET') return ok(url.searchParams.get('page') === '1' ? [...projects.values()] : []);
+    const object = path.match(/^\/accounts\/\w+\/r2\/buckets\/([\w-]+)\/objects\/(.+)$/);
+    if (object) return objects.has(`${object[1]}/${object[2]}`) ? Response.json(objects.get(`${object[1]}/${object[2]}`)) : new Response('', { status: 404 });
     const project = path.match(/^\/accounts\/(\w+)\/pages\/projects\/([\w-]+)$/);
     if (project && method === 'GET') return projects.has(project[2]) ? ok(projects.get(project[2])) : fail(404, 'Project not found.', 8000007);
     if (project && method === 'PATCH') return ok({ ...projects.get(project[2]), patched: true });
@@ -167,3 +171,60 @@ assert.match(html, /一键部署/);
 assert.match(html, /不保存/);
 assert.match(page.headers.get('content-security-policy'), /connect-src 'self'/);
 console.log('PASS deploy page explains how the token is used');
+
+// 魔改版迁移：列出绑定了存储桶的站点，按云端总清单和最近一次部署分出魔改版和测试版；
+// 迁移时沿用站点原来的存储桶，重新设置同步密码和更新用的令牌，部署最新测试版；不建项目、不建桶、不碰数据。
+const migrateApi = async (action, body) => {
+    const response = await mirrorWorker.fetch(new Request(`https://mirror.test/api/deploy/${action}`, { method: 'POST', body: JSON.stringify(body) }), env);
+    return { status: response.status, body: await response.json() };
+};
+const site = (name, bucketName, extra = {}) => ({
+    name, subdomain: `${name}.pages.dev`, domains: [`${name}.pages.dev`],
+    deployment_configs: { production: { r2_buckets: { RP_SYNC_R2: { name: bucketName } }, env_vars: { RP_SYNC_PASSWORD: { type: 'secret_text' } } } },
+    ...extra
+});
+reset();
+projects.set('mogai', site('mogai', 'mogai-data', { domains: ['mogai.pages.dev', 'rp.example.com'] }));
+projects.set('ours', site('ours', 'ours-data', { latest_deployment: { deployment_trigger: { metadata: { commit_message: 'RP-Hub 测试版 2026.10.10.6（站内一键更新）' } } } }));
+projects.set('fresh', site('fresh', 'fresh-data'));
+projects.set('blog', { name: 'blog', subdomain: 'blog.pages.dev', deployment_configs: { production: {} } });
+objects.set('mogai-data/rp-sync/main/manifest.json', { format: 'rp-sync-manifest-root-v1', version: 9, updatedAt: 1760300000000 });
+objects.set('ours-data/rp-sync/main/manifest.json', { mode: 'r2-chunk-manifest-v1', version: 3 });
+const found = await migrateApi('sites', { token: 'cf-token' });
+assert.deepEqual(found.body.sites, [
+    { name: 'mogai', url: 'https://rp.example.com', kind: 'fork', syncedAt: 1760300000000 },
+    { name: 'ours', url: 'https://ours.pages.dev', kind: 'test', syncedAt: 0 },
+    { name: 'fresh', url: 'https://fresh.pages.dev', kind: 'unknown', syncedAt: 0 }
+]);
+assert.ok(!calls.some((call) => call.method !== 'GET'), 'listing changes nothing');
+console.log('PASS the migrate page lists sites with a bucket and tells fork sites from test build sites');
+
+calls.length = 0;
+result = await migrateApi('migrate', { token: 'cf-token', projectName: 'mogai', password: 'fork-pass' });
+assert.equal(result.status, 200, JSON.stringify(result.body));
+assert.deepEqual(result.body, { ok: true, version: '2026.10.10.6', projectName: 'mogai', url: 'https://rp.example.com', deploymentUrl: 'https://dep-1.my-rph-x1.pages.dev' });
+const migratePatch = calls.find((call) => call.method === 'PATCH').body.deployment_configs.production;
+assert.deepEqual(migratePatch.r2_buckets, { RP_SYNC_R2: { name: 'mogai-data' } }, 'the site keeps its own bucket');
+assert.deepEqual(migratePatch.env_vars.RP_SYNC_PASSWORD, { type: 'secret_text', value: 'fork-pass' });
+assert.deepEqual(migratePatch.env_vars.CF_API_TOKEN, { type: 'secret_text', value: 'cf-token' });
+assert.ok(calls.some((call) => call.method === 'POST' && call.path === `/accounts/${ACCOUNT_A}/pages/projects/mogai/deployments`));
+assert.ok(!calls.some((call) => /\/pages\/projects$|\/r2\/buckets$|\/objects\//.test(call.path)), 'no project or bucket is created and no data is touched');
+console.log('PASS migrating keeps the site bucket, resets the password and update token, and deploys the latest test build');
+
+for (const [bad, pattern] of [[{ projectName: 'mogai', password: '123' }, /至少 6 位/], [{ password: 'fork-pass' }, /选择/], [{ projectName: 'blog', password: 'fork-pass' }, /没有绑定/]]) {
+    const refused = await migrateApi('migrate', { token: 'cf-token', ...bad });
+    assert.equal(refused.status, 400, JSON.stringify(refused.body));
+    assert.match(refused.body.error, pattern);
+}
+accounts.push({ id: ACCOUNT_B, name: '空帐户' });
+assert.equal((await migrateApi('sites', { token: 'cf-token' })).body.code, 'CHOOSE_ACCOUNT');
+accounts.pop();
+assert.equal((await migrateApi('sites', { token: 'bad' })).body.code, 'TOKEN_INVALID');
+console.log('PASS migration refuses short passwords, missing choices, sites without a bucket and ambiguous accounts');
+
+const migratePage = await mirrorWorker.fetch(new Request('https://mirror.test/migrate'), env);
+const migrateHtml = await migratePage.text();
+assert.match(migrateHtml, /从魔改版迁移/);
+assert.match(migrateHtml, /「下载」/);
+assert.match(migratePage.headers.get('content-security-policy'), /connect-src 'self'/);
+console.log('PASS migrate page explains what happens before and after');
