@@ -8,6 +8,8 @@ compatibility_flags = ["nodejs_compat"]
 UPSTREAM_REPO = "STA1N156/RP-Hub"
 RELEASE_LIMIT = "12"
 TEST_RELEASE_REPO = "ShirahaTobisa/RP-Hub"
+# 国内优选用的优选域名：定时把它的 A 记录换成国内访问快的 Cloudflare 节点，用户站点的国内线路 CNAME 到它。
+BEST_IP_HOST = "yx.rph.mornye.uk"
 
 [observability]
 enabled = true

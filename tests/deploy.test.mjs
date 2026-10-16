@@ -14,8 +14,9 @@ bucket.seedJson('test-releases/2026.10.10.6/bundle.json', {
 });
 const env = { MIRROR_BUCKET: bucket };
 
-let accounts, projects, buckets, r2Enabled, takenNames, zones, dnsRecords, objects;
+let accounts, projects, buckets, r2Enabled, takenNames, zones, dnsRecords, objects, dnspod, domainStatus;
 const calls = [];
+const dnspodCalls = [];
 const ok = (result) => Response.json({ success: true, result });
 const fail = (status, message, code = 1000) => Response.json({ success: false, errors: [{ code, message }] }, { status });
 function reset() {
@@ -28,9 +29,26 @@ function reset() {
     dnsRecords = [];
     objects = new Map();
     calls.length = 0;
+    dnspodCalls.length = 0;
+    dnspod = { domains: ['example.com'], records: [], token: '1,abcdefghijklmnop' };
+    domainStatus = { status: 'pending', validation_data: { status: 'pending' }, verification_data: { status: 'pending' } };
+}
+// DNSPod 旧版接口的模拟：Domain.Info 认域名，Record.List 按主机记录筛，Record.Create 追加。
+function dnspodReply(action, params) {
+    dnspodCalls.push({ action, params });
+    const reply = (code, extra = {}) => Response.json({ status: { code: String(code), message: code === 1 ? 'Action completed successful' : 'error' }, ...extra });
+    if (params.login_token !== dnspod.token) return reply(-1);
+    if (action === 'Domain.Info') return dnspod.domains.includes(params.domain) ? reply(1, { domain: { id: '1', name: params.domain } }) : reply(6);
+    if (action === 'Record.List') return reply(1, { records: dnspod.records.filter((record) => record.name === params.sub_domain) });
+    if (action === 'Record.Create') {
+        dnspod.records.push({ id: String(dnspod.records.length + 1), name: params.sub_domain, type: params.record_type, line: params.record_line, value: params.value, ttl: params.ttl });
+        return reply(1, { record: { id: '1' } });
+    }
+    return reply(99);
 }
 globalThis.fetch = async (input, init = {}) => {
     const url = new URL(String(input));
+    if (url.origin === 'https://dnsapi.cn') return dnspodReply(url.pathname.slice(1), Object.fromEntries(init.body));
     assert.equal(url.origin, 'https://api.cloudflare.com');
     const path = url.pathname.replace('/client/v4', '');
     const method = init.method || 'GET';
@@ -57,6 +75,8 @@ globalThis.fetch = async (input, init = {}) => {
         return ok({ name: JSON.parse(init.body).name });
     }
     if (path.endsWith('/upload-token')) return ok({ jwt: 'upload-jwt' });
+    const domainInfo = path.match(/\/pages\/projects\/[\w-]+\/domains\/([^/]+)$/);
+    if (domainInfo && method === 'GET') return ok({ name: domainInfo[1], ...domainStatus });
     if (/\/pages\/projects\/[\w-]+\/domains$/.test(path)) return ok({ name: JSON.parse(init.body).name, status: 'pending' });
     if (path === '/zones') return ok(zones.filter((zone) => zone.name === url.searchParams.get('name')));
     const dns = path.match(/^\/zones\/(\w+)\/dns_records$/);
@@ -164,6 +184,67 @@ assert.equal(result.body.customDomain.status, 'manual');
 assert.match(result.body.customDomain.message, /CNAME 记录：rph\.other\.org → my-rph-x1\.pages\.dev/);
 assert.equal((await deploy({ ...base, customDomain: 'x.pages.dev' })).status, 400);
 console.log('PASS custom domains are attached; DNS is added only in the same account and never overwritten');
+
+// 国内优选：分发站的优选域名有 IP 时才可选；境外线路 CNAME 到 pages.dev、默认线路 CNAME 到优选域名。
+// 给了 DNSPod Token 就自动加记录（只加缺的、不覆盖别的记录），没给就列出两条记录让用户手动加；之后前端轮询域名状态。
+const BEST_RECORDS = [{ line: '境外', type: 'CNAME', value: 'my-rph-x1.pages.dev' }, { line: '默认', type: 'CNAME', value: 'yx.rph.test' }];
+reset();
+result = await deploy({ ...base, customDomain: 'rph.example.com', bestIp: true });
+assert.deepEqual([result.status, result.body.code], [503, 'BEST_IP_UNAVAILABLE'], 'no best-IP state yet');
+bucket.seedJson('_mirror/best-ips.json', { host: 'yx.rph.test', ips: ['104.16.1.1'], updatedAt: 1 });
+assert.equal((await deploy({ ...base, bestIp: true })).status, 400, 'best IP needs a custom domain');
+assert.equal((await deploy({ ...base, customDomain: 'rph.example.com', bestIp: true, dnspodToken: 'nope' })).status, 400, 'token format is checked');
+reset();
+zones = [{ id: 'zone1', name: 'example.com' }];
+result = await deploy({ ...base, customDomain: 'rph.example.com', bestIp: true });
+assert.equal(result.body.ok, true, JSON.stringify(result.body));
+assert.deepEqual([result.body.customDomain.status, result.body.customDomain.bestIp, result.body.customDomain.records], ['manual', true, BEST_RECORDS]);
+assert.match(result.body.customDomain.message, /DNSPod/);
+assert.ok(!calls.some((call) => call.path === '/zones' || call.path.includes('/dns_records')), 'Cloudflare DNS is left alone even when the zone exists there');
+assert.deepEqual(dnspodCalls, []);
+console.log('PASS without a DNSPod token the two records to add are listed and nothing is written');
+
+reset();
+result = await deploy({ ...base, customDomain: 'rph.example.com', bestIp: true, dnspodToken: dnspod.token });
+assert.equal(result.body.customDomain.status, 'ready', JSON.stringify(result.body.customDomain));
+assert.deepEqual(dnspodCalls.map((call) => call.action), ['Domain.Info', 'Domain.Info', 'Record.List', 'Record.Create', 'Record.Create']);
+assert.deepEqual(dnspodCalls.slice(0, 2).map((call) => call.params.domain), ['rph.example.com', 'example.com']);
+assert.deepEqual(dnspod.records.map((record) => [record.name, record.type, record.line, record.value, record.ttl]),
+    [['rph', 'CNAME', '境外', 'my-rph-x1.pages.dev', '600'], ['rph', 'CNAME', '默认', 'yx.rph.test', '600']]);
+assert.ok(dnspodCalls.every((call) => call.params.format === 'json' && call.params.login_token === dnspod.token));
+assert.ok(!JSON.stringify(result.body).includes(dnspod.token), 'the DNSPod token never comes back in the response');
+console.log('PASS with a DNSPod token both line-specific CNAME records are created under the right domain');
+
+reset();
+dnspod.records = [{ id: '9', name: 'rph', type: 'CNAME', line: '境外', value: 'my-rph-x1.pages.dev.' }];
+result = await deploy({ ...base, customDomain: 'rph.example.com', bestIp: true, dnspodToken: dnspod.token });
+assert.equal(result.body.customDomain.status, 'ready');
+assert.deepEqual(dnspodCalls.filter((call) => call.action === 'Record.Create').map((call) => call.params.record_line), ['默认'], 'only the missing record is added');
+reset();
+dnspod.records = [{ id: '9', name: 'rph', type: 'A', line: '默认', value: '1.2.3.4' }];
+result = await deploy({ ...base, customDomain: 'rph.example.com', bestIp: true, dnspodToken: dnspod.token });
+assert.equal(result.body.customDomain.status, 'manual');
+assert.match(result.body.customDomain.message, /已有其他记录（默认 A 1\.2\.3\.4）/);
+assert.equal(dnspod.records.length, 1, 'existing records are never overwritten');
+reset();
+result = await deploy({ ...base, customDomain: 'rph.nodomain.org', bestIp: true, dnspodToken: dnspod.token });
+assert.match(result.body.customDomain.message, /DNSPod 里没有 rph\.nodomain\.org 所属的域名/);
+reset();
+result = await deploy({ ...base, customDomain: 'rph.example.com', bestIp: true, dnspodToken: '1,wrongwrongwrong' });
+assert.deepEqual([result.body.customDomain.status, result.body.customDomain.records], ['manual', BEST_RECORDS]);
+assert.match(result.body.customDomain.message, /Token 无效/);
+console.log('PASS existing DNSPod records are respected and DNSPod problems fall back to the manual list');
+
+const domainApi = (body) => mirrorWorker.fetch(new Request('https://mirror.test/api/deploy/domain', { method: 'POST', body: JSON.stringify(body) }), env).then((response) => response.json());
+reset();
+assert.deepEqual(await domainApi({ token: 'cf-token', projectName: 'my-rph', domain: 'rph.example.com' }), { ok: true, status: 'pending', message: '等待 DNS 记录生效和证书签发' });
+domainStatus = { status: 'active', validation_data: { status: 'active' }, verification_data: { status: 'active' } };
+assert.equal((await domainApi({ token: 'cf-token', projectName: 'my-rph', domain: 'rph.example.com' })).status, 'active');
+domainStatus = { status: 'error', verification_data: { status: 'error', error_message: 'CNAME not found' } };
+assert.equal((await domainApi({ token: 'cf-token', projectName: 'my-rph', domain: 'rph.example.com' })).message, '出错：CNAME not found');
+assert.equal((await domainApi({ token: 'cf-token', projectName: 'my-rph', domain: 'bad domain' })).ok, false);
+assert.ok(calls.some((call) => call.method === 'GET' && call.path === `/accounts/${ACCOUNT_A}/pages/projects/my-rph/domains/rph.example.com`));
+console.log('PASS the domain status endpoint maps Pages domain states to plain words');
 
 const page = await mirrorWorker.fetch(new Request('https://mirror.test/deploy'), env);
 const html = await page.text();

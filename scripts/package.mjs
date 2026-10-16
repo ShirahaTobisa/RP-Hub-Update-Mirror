@@ -17,7 +17,7 @@ const STATIC_IMPORT = /^\s*import\b/m;
 const ANY_EXPORT = /^\s*export\s+/gm;
 const DEFAULT_EXPORT = /^\s*export\s+default\b/gm;
 // 测试要用的函数：打包时去掉 export，只保留 export default。
-const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases', 'submitWorkshopPlugin', 'readPluginManifest'];
+const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases', 'submitWorkshopPlugin', 'readPluginManifest', 'syncBestIps'];
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const sourceRoot = path.resolve(scriptDirectory, '..');
@@ -133,7 +133,7 @@ function deployReadme(sourceReadme) {
 function scanForSensitiveValues(root) {
     const patterns = [
         { label: 'Cloudflare API token', expression: /cfat_[A-Za-z0-9_-]{20,}/ },
-        { label: 'assigned secret value', expression: /(?:GITHUB_TOKEN|WEBHOOK_URL|WEBHOOK_TOKEN|ADMIN_TOKEN)\s*=\s*['"][^'"]+['"]/ }
+        { label: 'assigned secret value', expression: /(?:GITHUB_TOKEN|WEBHOOK_URL|WEBHOOK_TOKEN|ADMIN_TOKEN|BEST_IP_DNS_TOKEN)\s*=\s*['"][^'"]+['"]/ }
     ];
     const findings = [];
     for (const file of fs.readdirSync(root)) {
