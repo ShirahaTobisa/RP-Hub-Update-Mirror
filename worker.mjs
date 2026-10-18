@@ -2398,8 +2398,12 @@ async function runDeploy(request, env, options) {
         if (error.cfStatus === 404 || error.cfCodes?.includes(8000007)) return null;
         throw error;
     });
+    // 覆盖时沿用项目原来绑定的桶：换成页面上填的桶，站点会连到另一个（可能是空的）桶，看起来像数据没了。
+    const currentBucket = project?.deployment_configs?.production?.r2_buckets?.RP_SYNC_R2?.name || '';
     if (project && body?.overwrite !== true) {
-        throw new DeployError(`项目「${projectName}」已存在。继续会用最新测试版覆盖它，并重新设置存储桶绑定和同步密码。`, 'PROJECT_EXISTS', 409);
+        throw new DeployError(currentBucket
+            ? `项目「${projectName}」已存在，它现在用的存储桶是「${currentBucket}」。继续会用最新测试版覆盖它并重新设置同步密码，存储桶照旧用「${currentBucket}」。`
+            : `项目「${projectName}」已存在。继续会用最新测试版覆盖它，并重新设置存储桶绑定和同步密码。`, 'PROJECT_EXISTS', 409);
     }
     // 项目名同时是 *.pages.dev 网址，全体 Cloudflare 用户共用；被别人占用时加随机后缀重试。
     for (let attempt = 0; !project; attempt += 1) {
@@ -2414,14 +2418,15 @@ async function runDeploy(request, env, options) {
         if (project) projectPath = `/accounts/${account}/pages/projects/${project.name || name}`;
     }
     const finalName = project.name || projectName;
-    const bucketPath = `/accounts/${account}/r2/buckets/${bucketName}`;
+    const syncBucket = currentBucket || bucketName;
+    const bucketPath = `/accounts/${account}/r2/buckets/${syncBucket}`;
     const existingBucket = await cfCall(fetchImpl, token, bucketPath).catch((error) => {
         if (error.cfStatus === 404 || error.cfCodes?.includes(10006)) return null;
         throw error;
     });
     if (!existingBucket) {
         await cfCall(fetchImpl, token, `/accounts/${account}/r2/buckets`, {
-            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: bucketName })
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: syncBucket })
         }).catch((error) => {
             if (/enable r2|r2.*(not enabled|subscri|purchase)|activat/i.test(error.detail || '')) {
                 throw new DeployError(explainCfError(error.detail, 409).replace(/^Cloudflare 返回错误：/, '这个帐户还没开通 R2，请到 Cloudflare 后台「R2 对象存储」开通后再部署：'), 'R2_NOT_ENABLED', 409);
@@ -2429,7 +2434,7 @@ async function runDeploy(request, env, options) {
             throw error;
         });
     }
-    await configureProject(fetchImpl, token, account, projectPath, bucketName, password);
+    await configureProject(fetchImpl, token, account, projectPath, syncBucket, password);
     const deployment = await uploadPagesBundle(fetchImpl, token, account, finalName, bundle);
     const subdomain = project.subdomain || `${finalName}.pages.dev`;
     const domain = customDomain ? await attachCustomDomain(fetchImpl, token, account, finalName, customDomain, subdomain, bestIp) : null;

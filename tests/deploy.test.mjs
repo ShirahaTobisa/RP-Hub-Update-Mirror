@@ -131,7 +131,21 @@ assert.ok(!calls.some((call) => call.method === 'PATCH' || call.path.endsWith('/
 result = await deploy({ ...base, overwrite: true });
 assert.equal(result.body.ok, true);
 assert.equal(result.body.bucketCreated, false);
+assert.deepEqual(calls.find((call) => call.method === 'PATCH').body.deployment_configs.production.r2_buckets, { RP_SYNC_R2: { name: 'rph-data' } }, 'a project without a bucket binding uses the bucket typed on the page');
 console.log('PASS an existing project is only overwritten after confirmation; an existing bucket is reused');
+
+// 覆盖原来绑了别的桶的项目：提示里说出原来的桶，覆盖后照旧绑它，不去新建页面上填的桶。
+reset();
+projects.set('my-rph', { name: 'my-rph', subdomain: 'my-rph.pages.dev', deployment_configs: { production: { r2_buckets: { RP_SYNC_R2: { name: 'old-data' } } } } });
+buckets.add('old-data');
+result = await deploy(base);
+assert.deepEqual([result.status, result.body.code], [409, 'PROJECT_EXISTS']);
+assert.match(result.body.error, /现在用的存储桶是「old-data」/);
+result = await deploy({ ...base, overwrite: true });
+assert.deepEqual([result.body.ok, result.body.bucketCreated], [true, false]);
+assert.deepEqual(calls.find((call) => call.method === 'PATCH').body.deployment_configs.production.r2_buckets, { RP_SYNC_R2: { name: 'old-data' } });
+assert.ok(!buckets.has('rph-data'), 'the bucket typed on the page is not created');
+console.log('PASS overwriting a project keeps the bucket it was bound to and names it in the confirmation');
 
 reset();
 r2Enabled = false;
