@@ -44,7 +44,6 @@ npm run build
 - Secrets：`GITHUB_TOKEN`、`ADMIN_TOKEN`；使用通知时另设 `WEBHOOK_URL`、`WEBHOOK_TOKEN`。
 - 自定义域名 `update.rph.mornye.uk`，由 Cloudflare 控制台绑定。
 - 使用后台同步或等待定时同步，生成版本与公告清单。
-- 国内优选（可选）：`wrangler.toml` 里的 `BEST_IP_HOST` 是分发站维护的优选域名（默认 `yx.rph.mornye.uk`，所属区域须在 Cloudflare 上），再设 secret `BEST_IP_DNS_TOKEN`（权限：区域 → 区域 → 读取、区域 → DNS → 编辑，区域资源选该域名）。定时任务每半小时从公开优选列表取 Cloudflare 官方网段内的 IP 写成它的 A 记录，来源和手动指定 IP 在管理页「设置 → 国内优选」。优选域名有 IP 后，部署页出现「国内优选」选项：用户域名放 DNSPod，境外线路 CNAME → pages.dev（Cloudflare 验证和签证书走这条），默认线路 CNAME → 优选域名；给了 DNSPod Token 就自动添加，否则列出两条记录手动加。
 
 密钥通过 `npx wrangler secret put 名称` 交互设置。GitHub Actions 只做测试和打包，不自动部署。
 

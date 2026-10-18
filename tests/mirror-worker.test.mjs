@@ -843,8 +843,7 @@ async function testStatusAndConsoleEscapeSecrets() {
         GITHUB_TOKEN: 'github-secret-value',
         WEBHOOK_URL: 'https://webhook.test/private-secret-path',
         WEBHOOK_TOKEN: 'webhook-secret-value',
-        ADMIN_TOKEN: 'admin-secret-value',
-        BEST_IP_DNS_TOKEN: 'best-ip-dns-secret-value'
+        ADMIN_TOKEN: 'admin-secret-value'
     };
     bucket.seedJson('manifest.json', {
         schema: 1,
@@ -888,7 +887,7 @@ async function testStatusAndConsoleEscapeSecrets() {
     for (const value of Object.values(secretValues)) assert.equal(statusText.includes(value), false);
     for (const name of Object.keys(secretValues)) assert.equal(statusText.includes(name), false);
     const status = JSON.parse(statusText);
-    assert.deepEqual(Object.keys(status.secrets), ['github', 'webhook', 'webhookAuth', 'admin', 'bestIpDns']);
+    assert.deepEqual(Object.keys(status.secrets), ['github', 'webhook', 'webhookAuth', 'admin']);
     assert(Object.values(status.secrets).every((value) => typeof value === 'boolean' && value));
     assert.deepEqual(Object.keys(status.manifest.versions[0]), ['tag', 'commit', 'publishedAt', 'fileCount']);
     assert.deepEqual(Object.keys(status.manifest.pending[0]), ['tag', 'commit', 'reason', 'detail', 'seenAt']);
@@ -1045,8 +1044,8 @@ async function testRuntimeConfigClampFailSoftAndWebhookDisable() {
         adminEnv(bucket)
     );
     assert.equal(response.status, 200);
-    assert.deepEqual((await response.json()).config, { releaseLimit: 12, webhookEnabled: true, bestIpSources: ['https://addressesapi.090227.xyz/CloudFlareYes', 'https://ipdb.api.030101.xyz/?type=bestcf'], bestIpManual: [] });
-    assert.deepEqual(bucket.json('_mirror/config.json'), { releaseLimit: 12, webhookEnabled: true, bestIpSources: ['https://addressesapi.090227.xyz/CloudFlareYes', 'https://ipdb.api.030101.xyz/?type=bestcf'], bestIpManual: [] });
+    assert.deepEqual((await response.json()).config, { releaseLimit: 12, webhookEnabled: true });
+    assert.deepEqual(bucket.json('_mirror/config.json'), { releaseLimit: 12, webhookEnabled: true });
 
     response = await workerFetch(
         adminRequest('/api/config', {

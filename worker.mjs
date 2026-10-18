@@ -89,7 +89,7 @@ function configuredSecret(env, key) {
 
 function redactText(value, env) {
     let message = String(value ?? '');
-    const values = ['GITHUB_TOKEN', 'WEBHOOK_URL', 'WEBHOOK_TOKEN', 'ADMIN_TOKEN', 'BEST_IP_DNS_TOKEN']
+    const values = ['GITHUB_TOKEN', 'WEBHOOK_URL', 'WEBHOOK_TOKEN', 'ADMIN_TOKEN']
         .map((key) => typeof env?.[key] === 'string' ? env[key] : '')
         .filter(Boolean)
         .sort((left, right) => right.length - left.length);
@@ -197,52 +197,25 @@ function clampReleaseLimit(value) {
     return Math.max(1, Math.min(Number(value), DEFAULT_RELEASE_LIMIT));
 }
 
-const BEST_IP_DEFAULT_SOURCES = ['https://addressesapi.090227.xyz/CloudFlareYes', 'https://ipdb.api.030101.xyz/?type=bestcf'];
-const IPV4_SOURCE = '(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)(?:\\.(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)){3}';
-const IPV4_EXACT = new RegExp(`^${IPV4_SOURCE}$`);
-const IPV4_ANY = new RegExp(`\\b${IPV4_SOURCE}\\b`, 'g');
-const CIDR_ANY = new RegExp(`\\b${IPV4_SOURCE}/\\d{1,2}\\b`, 'g');
-
 function defaultRuntimeConfig(env) {
     return {
         releaseLimit: normalizeReleaseLimit(env?.RELEASE_LIMIT),
-        webhookEnabled: true,
-        bestIpSources: [...BEST_IP_DEFAULT_SOURCES],
-        bestIpManual: []
+        webhookEnabled: true
     };
-}
-
-// 优选来源（https 地址）或手动指定的 IP 列表：去重，最多 20 项；格式不对返回 null。
-function bestIpList(value, kind) {
-    if (!Array.isArray(value) || value.length > 20) return null;
-    const items = [...new Set(value.map((item) => String(item ?? '').trim()).filter(Boolean))];
-    return items.every((item) => kind === 'url' ? /^https:\/\/\S+$/.test(item) : IPV4_EXACT.test(item)) ? items : null;
-}
-
-// 一项配置的校验和写入；不合法时抛错，读存储时由调用方整体退回默认值。
-function applyConfigValue(config, key, value) {
-    if (key === 'releaseLimit') {
-        if (typeof value !== 'number' || !Number.isInteger(value)) throw new Error('releaseLimit 必须是整数。');
-        config.releaseLimit = clampReleaseLimit(value);
-    } else if (key === 'webhookEnabled') {
-        if (typeof value !== 'boolean') throw new Error('webhookEnabled 必须是布尔值。');
-        config.webhookEnabled = value;
-    } else if (key === 'bestIpSources' || key === 'bestIpManual') {
-        const list = bestIpList(value, key === 'bestIpSources' ? 'url' : 'ip');
-        if (!list) throw new Error(`${key} 必须是${key === 'bestIpSources' ? 'https 地址' : 'IPv4 地址'}列表，最多 20 项。`);
-        config[key] = list;
-    } else {
-        throw new Error('只允许 releaseLimit、webhookEnabled、bestIpSources 和 bestIpManual。');
-    }
 }
 
 function mergeStoredRuntimeConfig(value, fallback) {
     if (!plainObject(value)) return fallback;
+    const keys = Object.keys(value);
+    if (keys.some((key) => key !== 'releaseLimit' && key !== 'webhookEnabled')) return fallback;
     const config = { ...fallback };
-    try {
-        for (const [key, item] of Object.entries(value)) applyConfigValue(config, key, item);
-    } catch {
-        return fallback;
+    if (Object.hasOwn(value, 'releaseLimit')) {
+        if (typeof value.releaseLimit !== 'number' || !Number.isInteger(value.releaseLimit)) return fallback;
+        config.releaseLimit = clampReleaseLimit(value.releaseLimit);
+    }
+    if (Object.hasOwn(value, 'webhookEnabled')) {
+        if (typeof value.webhookEnabled !== 'boolean') return fallback;
+        config.webhookEnabled = value.webhookEnabled;
     }
     return config;
 }
@@ -267,10 +240,24 @@ async function readRuntimeConfig(bucket, env) {
 
 function configUpdate(value, current) {
     if (!plainObject(value)) throw new Error('配置必须是 JSON 对象。');
-    const entries = Object.entries(value);
-    if (entries.length === 0) throw new Error('至少提供一项配置。');
+    const keys = Object.keys(value);
+    if (keys.length === 0) throw new Error('至少提供一项配置。');
+    if (keys.some((key) => key !== 'releaseLimit' && key !== 'webhookEnabled')) {
+        throw new Error('只允许 releaseLimit 和 webhookEnabled。');
+    }
     const config = { ...current };
-    for (const [key, item] of entries) applyConfigValue(config, key, item);
+    if (Object.hasOwn(value, 'releaseLimit')) {
+        if (typeof value.releaseLimit !== 'number' || !Number.isInteger(value.releaseLimit)) {
+            throw new Error('releaseLimit 必须是整数。');
+        }
+        config.releaseLimit = clampReleaseLimit(value.releaseLimit);
+    }
+    if (Object.hasOwn(value, 'webhookEnabled')) {
+        if (typeof value.webhookEnabled !== 'boolean') {
+            throw new Error('webhookEnabled 必须是布尔值。');
+        }
+        config.webhookEnabled = value.webhookEnabled;
+    }
     return config;
 }
 
@@ -1874,18 +1861,14 @@ async function buildStatus(env) {
         config: {
             releaseLimit: configState.config.releaseLimit,
             webhookEnabled: configState.config.webhookEnabled,
-            bestIpSources: configState.config.bestIpSources,
-            bestIpManual: configState.config.bestIpManual,
             upstreamRepo: statusString(effectiveRepo(env), env, 300)
         },
         secrets: {
             github: configuredSecret(env, 'GITHUB_TOKEN'),
             webhook: configuredSecret(env, 'WEBHOOK_URL'),
             webhookAuth: configuredSecret(env, 'WEBHOOK_TOKEN'),
-            admin: configuredSecret(env, 'ADMIN_TOKEN'),
-            bestIpDns: configuredSecret(env, 'BEST_IP_DNS_TOKEN')
+            admin: configuredSecret(env, 'ADMIN_TOKEN')
         },
-        bestIp: await bestIpStatus(env),
         RP_HUB_APP_PATCH_REVISION
     };
 }
@@ -2113,9 +2096,8 @@ async function uploadPagesBundle(fetchImpl, token, account, project, bundle) {
     return cfCall(fetchImpl, token, `${projectPath}/deployments`, { method: 'POST', body: form });
 }
 
-// 自定义域名：先加到 Pages 项目。选了国内优选就去 DNSPod 加两条分线路 CNAME（没给 DNSPod Token 则只列出要加的记录）；
-// 否则域名托管在同一帐户时补一条 CNAME。缺权限或已有记录指向别处时不覆盖，返回手动操作说明。
-async function attachCustomDomain(fetchImpl, token, account, project, domain, subdomain, bestIp = null) {
+// 自定义域名：先加到 Pages 项目；域名托管在同一帐户时再补一条 CNAME。缺权限或已有记录指向别处时不覆盖，返回手动操作说明。
+async function attachCustomDomain(fetchImpl, token, account, project, domain, subdomain) {
     const manual = `在域名的 DNS 里添加 CNAME 记录：${domain} → ${subdomain}`;
     try {
         await cfCall(fetchImpl, token, `/accounts/${account}/pages/projects/${project}/domains`, {
@@ -2124,18 +2106,16 @@ async function attachCustomDomain(fetchImpl, token, account, project, domain, su
     } catch (error) {
         if (!/already|exist/i.test(error.detail || '') || /another project/i.test(error.detail || '')) return { name: domain, status: 'failed', message: `域名没能加到项目：${error.message}` };
     }
-    if (bestIp) {
-        const result = { name: domain, bestIp: true, records: bestIpRecords(subdomain, bestIp.host) };
-        if (!bestIp.dnspodToken) return { ...result, status: 'manual', message: '到 DNSPod 给这个域名加下面两条记录（域名不能托管在 Cloudflare）。' };
-        try {
-            await applyDnspodRecords(fetchImpl, bestIp.dnspodToken, domain, result.records);
-            return { ...result, status: 'ready', message: '已在 DNSPod 添加下面两条记录，证书签发通常要几分钟。' };
-        } catch (error) {
-            return { ...result, status: 'manual', message: `${error instanceof DeployError ? error.message : 'DNSPod 操作失败。'}请手动确认下面两条记录。` };
+    const labels = domain.split('.');
+    let zone = null;
+    try {
+        for (let index = 0; index < labels.length - 1 && !zone; index += 1) {
+            const zones = await cfCall(fetchImpl, token, `/zones?name=${labels.slice(index).join('.')}&account.id=${account}`);
+            zone = zones[0] || null;
         }
+    } catch (_) {
+        return { name: domain, status: 'manual', message: `令牌没有读取域名的权限。${manual}` };
     }
-    const zone = await findZone(fetchImpl, token, domain, account).catch(() => undefined);
-    if (zone === undefined) return { name: domain, status: 'manual', message: `令牌没有读取域名的权限。${manual}` };
     if (!zone) return { name: domain, status: 'manual', message: `这个域名不在该 Cloudflare 帐户里。${manual}` };
     try {
         const records = await cfCall(fetchImpl, token, `/zones/${zone.id}/dns_records?name=${domain}`);
@@ -2149,197 +2129,6 @@ async function attachCustomDomain(fetchImpl, token, account, project, domain, su
     } catch (_) {
         return { name: domain, status: 'manual', message: `令牌没有修改 DNS 的权限。${manual}` };
     }
-}
-
-// 找出域名所属的 Cloudflare 区域；account 为空时按令牌能看到的范围找。找不到返回 null，接口出错抛错。
-async function findZone(fetchImpl, token, domain, account = '') {
-    const labels = domain.split('.');
-    for (let index = 0; index < labels.length - 1; index += 1) {
-        const zones = await cfCall(fetchImpl, token, `/zones?name=${labels.slice(index).join('.')}${account ? `&account.id=${account}` : ''}`);
-        if (zones[0]) return zones[0];
-    }
-    return null;
-}
-
-// ---- 国内优选 ----
-// 分发站维护一个优选域名（BEST_IP_HOST），定时把它的 A 记录换成国内访问快的 Cloudflare 官方节点 IP；
-// 用户站点的国内线路 CNAME 到它即可，不用自己测速、不用定期改。IP 来自公开优选列表（或管理页手动指定），
-// 只保留 Cloudflare 官方网段内的，列表被塞进别人的反代机器也不会生效。
-const BEST_IP_STATE_KEY = '_mirror/best-ips.json';
-const BEST_IP_LIMIT = 8;
-const CF_IPV4_RANGES_URL = 'https://www.cloudflare.com/ips-v4';
-// 拉不到官方列表时用这份（2026-10 的官方网段）。
-const CF_IPV4_RANGES_FALLBACK = ['173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22'];
-const DNSPOD_API_BASE = 'https://dnsapi.cn/';
-const DNSPOD_TOKEN_PATTERN = /^\d+,[A-Za-z0-9]{10,}$/;
-const DOMAIN_STATUS_TEXT = { active: '已生效', pending: '等待 DNS 记录生效和证书签发', initializing: '正在初始化', error: '出错', blocked: '被 Cloudflare 阻止', deactivated: '已停用' };
-
-function bestIpHost(env) {
-    const host = String(env?.BEST_IP_HOST || '').trim().toLowerCase();
-    return DEPLOY_DOMAIN_PATTERN.test(host) ? host : '';
-}
-
-function ipv4Number(ip) {
-    return ip.split('.').reduce((total, part) => total * 256 + Number(part), 0);
-}
-
-function inCloudflareRanges(ip, ranges) {
-    const value = ipv4Number(ip);
-    return ranges.some((range) => {
-        const [base, bits] = range.split('/');
-        const size = 2 ** (32 - Number(bits));
-        return Math.floor(value / size) === Math.floor(ipv4Number(base) / size);
-    });
-}
-
-async function fetchText(fetchImpl, url) {
-    const response = await fetchWithTimeout(fetchImpl, url, { headers: { 'user-agent': 'RP-Hub-R2-Mirror' } });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.text();
-}
-
-// 手动指定时直接用；否则依次试每个来源，取第一个给出官方网段内 IP 的。
-async function collectBestIps(fetchImpl, config) {
-    if (config.bestIpManual.length) return { ips: config.bestIpManual.slice(0, BEST_IP_LIMIT), source: '手动指定' };
-    const ranges = await fetchText(fetchImpl, CF_IPV4_RANGES_URL).then((text) => text.match(CIDR_ANY) || []).catch(() => []);
-    const errors = [];
-    for (const source of config.bestIpSources) {
-        try {
-            const ips = [...new Set((await fetchText(fetchImpl, source)).match(IPV4_ANY) || [])]
-                .filter((ip) => inCloudflareRanges(ip, ranges.length ? ranges : CF_IPV4_RANGES_FALLBACK))
-                .slice(0, BEST_IP_LIMIT);
-            if (ips.length) return { ips, source };
-            errors.push(`${source}：没有官方网段内的 IP`);
-        } catch (error) {
-            errors.push(`${source}：${toErrorMessage(error)}`);
-        }
-    }
-    throw new Error(`没有拿到优选 IP（${errors.join('；') || '没有配置来源'}）。`);
-}
-
-// 把优选域名的 A 记录换成给定 IP：先加缺的再删多的，一样就不动。返回是否有改动。
-async function setHostAddresses(fetchImpl, token, host, ips) {
-    const zone = await findZone(fetchImpl, token, host);
-    if (!zone) throw new Error(`Cloudflare 里找不到 ${host} 所属的域名，或令牌缺少「区域 → 读取」权限。`);
-    const records = await cfCall(fetchImpl, token, `/zones/${zone.id}/dns_records?type=A&name=${host}&per_page=100`);
-    const missing = ips.filter((ip) => !records.some((record) => record.content === ip));
-    const stale = records.filter((record) => !ips.includes(record.content));
-    for (const ip of missing) {
-        await cfCall(fetchImpl, token, `/zones/${zone.id}/dns_records`, {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ type: 'A', name: host, content: ip, ttl: 300, proxied: false })
-        });
-    }
-    for (const record of stale) await cfCall(fetchImpl, token, `/zones/${zone.id}/dns_records/${record.id}`, { method: 'DELETE' });
-    return missing.length + stale.length > 0;
-}
-
-async function readBestIpState(bucket) {
-    const value = await readJsonObject(bucket, BEST_IP_STATE_KEY).then((result) => result.value).catch(() => null);
-    return plainObject(value) && typeof value.host === 'string' && Array.isArray(value.ips) ? value : null;
-}
-
-async function bestIpStatus(env) {
-    const state = await readBestIpState(env.MIRROR_BUCKET);
-    return {
-        host: bestIpHost(env),
-        ips: (state?.ips || []).map((ip) => statusString(ip, env, 45)),
-        source: statusString(state?.source, env, 300),
-        updatedAt: Number(state?.updatedAt) || 0,
-        checkedAt: Number(state?.checkedAt) || 0,
-        error: statusString(state?.error, env, 500)
-    };
-}
-
-// 定时任务和管理页「立即更新 DNS」共用。没配优选域名或 DNS 令牌时跳过；出错时保留上一次的 IP，只记下错误。
-export async function syncBestIps(env, options = {}) {
-    const fetchImpl = options.fetchImpl || fetch;
-    const host = bestIpHost(env);
-    const token = typeof env?.BEST_IP_DNS_TOKEN === 'string' ? env.BEST_IP_DNS_TOKEN.trim() : '';
-    if (!host || !token) return { ok: false, skipped: true, error: '未配置 BEST_IP_HOST 或 BEST_IP_DNS_TOKEN。' };
-    const bucket = env.MIRROR_BUCKET;
-    const previous = await readBestIpState(bucket);
-    const now = nowValue(options.now || Date.now);
-    const state = { host, ips: previous?.ips || [], source: previous?.source || '', updatedAt: Number(previous?.updatedAt) || 0, checkedAt: now, error: '' };
-    try {
-        const { ips, source } = await collectBestIps(fetchImpl, await readRuntimeConfig(bucket, env));
-        const changed = await setHostAddresses(fetchImpl, token, host, ips);
-        Object.assign(state, { ips, source, updatedAt: changed || !state.updatedAt ? now : state.updatedAt });
-    } catch (error) {
-        state.error = safeErrorMessage(error, env);
-    }
-    await bucket.put(BEST_IP_STATE_KEY, JSON.stringify(state), { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
-    return { ok: !state.error, ...state };
-}
-
-// 国内优选的前提：填了自定义域名、分发站的优选域名已经有 IP；DNSPod Token 可选，格式「ID,Token」。
-async function bestIpRequest(env, customDomain, dnspodToken) {
-    if (!customDomain) throw new DeployError('国内优选需要先填自定义域名。');
-    const token = String(dnspodToken || '').trim();
-    if (token && !DNSPOD_TOKEN_PATTERN.test(token)) throw new DeployError('DNSPod Token 格式不对，应为「ID,Token」。');
-    const state = await readBestIpState(env.MIRROR_BUCKET);
-    if (!state?.ips.length) throw new DeployError('分发站的优选节点还没准备好，暂时不能选国内优选。', 'BEST_IP_UNAVAILABLE', 503);
-    return { host: state.host, dnspodToken: token };
-}
-
-// 国内线路 CNAME 到优选域名；境外线路 CNAME 到 pages.dev，Cloudflare 验证域名和签证书时从海外查询，看到的是这条。
-function bestIpRecords(subdomain, host) {
-    return [{ line: '境外', type: 'CNAME', value: subdomain }, { line: '默认', type: 'CNAME', value: host }];
-}
-
-// DNSPod 旧版接口（DNSPod Token，只管 DNSPod，不是腾讯云帐户密钥）。令牌只在这次请求里用，不保存、不写日志。
-async function dnspodCall(fetchImpl, loginToken, action, params = {}) {
-    const response = await fetchImpl(`${DNSPOD_API_BASE}${action}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'RP-Hub-Update-Mirror/1.0 (https://update.rph.mornye.uk)' },
-        body: new URLSearchParams({ login_token: loginToken, format: 'json', lang: 'cn', error_on_empty: 'no', ...params })
-    });
-    const data = await response.json().catch(() => null);
-    const code = String(data?.status?.code ?? '');
-    if (code === '1') return data;
-    const failure = new DeployError(code === '-1' ? 'DNSPod Token 无效，请到 DNSPod 控制台重新创建。' : `DNSPod 返回错误：${data?.status?.message || `HTTP ${response.status}`}。`);
-    failure.dnspodCode = code;
-    throw failure;
-}
-
-// 用户域名在 DNSPod 里对应的主域名和主机记录：rph.example.com → example.com + rph。
-async function dnspodDomain(fetchImpl, loginToken, domain) {
-    const labels = domain.split('.');
-    for (let index = 0; index < labels.length - 1; index += 1) {
-        const name = labels.slice(index).join('.');
-        const found = await dnspodCall(fetchImpl, loginToken, 'Domain.Info', { domain: name }).catch((error) => {
-            if (error.dnspodCode === '-1') throw error;
-            return null;
-        });
-        if (found) return { domain: name, sub: labels.slice(0, index).join('.') || '@' };
-    }
-    return null;
-}
-
-// 只加缺的记录；这个主机记录下已有别的记录时不覆盖，交给用户处理。
-async function applyDnspodRecords(fetchImpl, loginToken, domain, records) {
-    const target = await dnspodDomain(fetchImpl, loginToken, domain);
-    if (!target) throw new DeployError(`DNSPod 里没有 ${domain} 所属的域名。`);
-    const existing = (await dnspodCall(fetchImpl, loginToken, 'Record.List', { domain: target.domain, sub_domain: target.sub })).records || [];
-    const same = (record, wanted) => record.line === wanted.line && record.type === wanted.type && String(record.value).replace(/\.$/, '') === wanted.value;
-    const others = existing.filter((record) => !records.some((wanted) => same(record, wanted)));
-    if (others.length) throw new DeployError(`${domain} 在 DNSPod 里已有其他记录（${others.map((record) => `${record.line} ${record.type} ${record.value}`).join('、')}），没有覆盖。`);
-    for (const wanted of records.filter((wanted) => !existing.some((record) => same(record, wanted)))) {
-        await dnspodCall(fetchImpl, loginToken, 'Record.Create', {
-            domain: target.domain, sub_domain: target.sub, record_type: wanted.type, record_line: wanted.line, value: wanted.value, ttl: '600'
-        });
-    }
-}
-
-// 部署页轮询用：Pages 自定义域的状态（DNS 验证 + 证书）。
-async function describeDomainStatus(fetchImpl, token, account, body) {
-    const projectName = String(body?.projectName || '').trim().toLowerCase();
-    const domain = String(body?.domain || '').trim().toLowerCase();
-    if (!DEPLOY_PROJECT_PATTERN.test(projectName) || !DEPLOY_DOMAIN_PATTERN.test(domain)) throw new DeployError('项目名或域名格式不对。');
-    const info = await cfCall(fetchImpl, token, `/accounts/${account}/pages/projects/${projectName}/domains/${domain}`);
-    const detail = info.verification_data?.error_message || info.validation_data?.error_message || '';
-    const text = DOMAIN_STATUS_TEXT[info.status] || String(info.status || '未知');
-    return { ok: true, status: String(info.status || ''), message: detail ? `${text}：${detail}` : text };
 }
 
 // 令牌只能访问一个帐户就用它；多个时让用户选，查不到时让用户手动填。
@@ -2388,7 +2177,6 @@ async function runDeploy(request, env, options) {
     if (!DEPLOY_BUCKET_PATTERN.test(bucketName)) throw new DeployError('存储桶名只能用小写字母、数字和短横线，3～63 个字符。');
     const customDomain = String(body?.customDomain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     if (customDomain && (!DEPLOY_DOMAIN_PATTERN.test(customDomain) || customDomain.endsWith('.pages.dev'))) throw new DeployError('自定义域名格式不对，例如 rph.example.com。');
-    const bestIp = body?.bestIp === true ? await bestIpRequest(env, customDomain, body?.dnspodToken) : null;
     const account = await resolveDeployAccount(fetchImpl, token, body?.accountId);
     const bundle = await readLatestTestBundle(env.MIRROR_BUCKET);
 
@@ -2437,7 +2225,7 @@ async function runDeploy(request, env, options) {
     await configureProject(fetchImpl, token, account, projectPath, syncBucket, password);
     const deployment = await uploadPagesBundle(fetchImpl, token, account, finalName, bundle);
     const subdomain = project.subdomain || `${finalName}.pages.dev`;
-    const domain = customDomain ? await attachCustomDomain(fetchImpl, token, account, finalName, customDomain, subdomain, bestIp) : null;
+    const domain = customDomain ? await attachCustomDomain(fetchImpl, token, account, finalName, customDomain, subdomain) : null;
     return {
         ok: true,
         version: bundle.version,
@@ -2504,12 +2292,11 @@ async function handleDeployApi(request, env, options, action) {
             if (!token) throw new DeployError('请填写 Cloudflare 令牌。');
             return jsonResponse({ ok: true, accounts: await listDeployAccounts(token, options.fetchImpl) });
         }
-        if (action === 'sites' || action === 'migrate' || action === 'domain') {
+        if (action === 'sites' || action === 'migrate') {
             const body = await readJsonRequest(request, 8 * 1024).catch(() => null);
             const token = String(body?.token || '').trim();
             if (!token) throw new DeployError('请填写 Cloudflare 令牌。');
             const account = await resolveDeployAccount(options.fetchImpl, token, body?.accountId);
-            if (action === 'domain') return jsonResponse(await describeDomainStatus(options.fetchImpl, token, account, body));
             return jsonResponse(action === 'sites'
                 ? { ok: true, sites: await listMigrationSites(options.fetchImpl, token, account) }
                 : await runMigration(options.fetchImpl, env, token, account, body));
@@ -2534,17 +2321,14 @@ byId('accountManualInput').addEventListener('input',(event)=>{const value=event.
 `;
 
 const DEPLOY_SCRIPT = DEPLOY_COMMON_SCRIPT + String.raw`
-const form=byId('deployForm'),submit=byId('deploy'),bestIpBox=byId('bestIp');
-let overwrite=false,polls=0;
-function payload(){const bestIp=Boolean(bestIpBox&&bestIpBox.checked);return{...credentials(),projectName:byId('project').value.trim(),customDomain:byId('domain').value.trim(),bucketName:byId('bucket').value.trim(),password:byId('password').value,overwrite,bestIp,dnspodToken:bestIp?byId('dnspod').value.trim():''};}
+const form=byId('deployForm'),submit=byId('deploy');
+let overwrite=false;
+function payload(){return{...credentials(),projectName:byId('project').value.trim(),customDomain:byId('domain').value.trim(),bucketName:byId('bucket').value.trim(),password:byId('password').value,overwrite};}
 byId('token').addEventListener('change',()=>{overwrite=false;});
 byId('project').addEventListener('input',()=>{overwrite=false;});
-if(bestIpBox){byId('domain').addEventListener('input',()=>{byId('bestIpField').hidden=!byId('domain').value.trim();});bestIpBox.addEventListener('change',()=>{byId('dnspodField').hidden=!bestIpBox.checked;});}
-function showDomain(domain){const box=byId('doneDomain');box.hidden=!domain;if(!domain)return;box.textContent='自定义域名 '+domain.name+'：'+domain.message;if(domain.records){const list=document.createElement('ul');domain.records.forEach((record)=>{const item=document.createElement('li');item.textContent='线路「'+record.line+'」　'+record.type+'　'+domain.name+' → '+record.value;list.appendChild(item);});box.appendChild(list);}const state=document.createElement('p');state.id='domainState';box.appendChild(state);if(domain.status!=='failed')watchDomain(domain.name);}
-async function watchDomain(domain){const state=byId('domainState');state.textContent='域名状态：查询中…';const result=await post('/api/deploy/domain',{...credentials(),projectName:byId('doneName').textContent,domain});state.textContent='域名状态：'+(result.ok?result.message:(result.error||'查询失败'));if(result.ok&&result.status==='active'){state.textContent+='，可以用这个域名访问了。';return;}if(++polls<40){setTimeout(()=>watchDomain(domain),15000);return;}state.textContent+='。十分钟内还没生效，稍后到 Cloudflare 后台这个项目的「自定义域」里查看。';}
 form.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;say('正在部署，约需半分钟，请不要关闭页面…');
 try{const result=await post('/api/deploy',payload());
-if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;byId('doneName').textContent=result.projectName;showDomain(result.customDomain);form.hidden=true;byId('done').hidden=false;return;}
+if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;byId('doneDomain').textContent=result.customDomain?('自定义域名 '+result.customDomain.name+'：'+result.customDomain.message):'';byId('doneDomain').hidden=!result.customDomain;byId('doneName').textContent=result.projectName;form.hidden=true;byId('done').hidden=false;return;}
 if(await askAccount(result))return;
 if(result.code==='PROJECT_EXISTS'){if(confirm(result.error+'\n\n确定继续吗？')){overwrite=true;submit.disabled=false;form.requestSubmit();return;}say('已取消。换个项目名再部署，或确认覆盖。','warn');return;}
 say(result.error||'部署失败','error');}catch(error){say('部署失败：'+error.message,'error');}finally{submit.disabled=false;}});
@@ -2579,11 +2363,7 @@ const DEPLOY_TOKEN_USAGE = `<h2>这个令牌会被怎样使用</h2>
 </ul>`;
 const DEPLOY_PAGE_CSS = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:6px 0}select{width:100%}@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
 
-// 分发站的优选域名有 IP 时，部署页才显示「国内优选」选项。
-function renderDeployHtml(bestIp = null) {
-    const host = bestIp?.ips?.length ? escapeHtml(bestIp.host) : '';
-    const bestIpFields = host ? `<div id="bestIpField" class="field" hidden><label><input id="bestIp" type="checkbox"> 国内优选</label><small>域名的 DNS 要放在 DNSPod 这类支持分线路的服务商，不能托管在 Cloudflare。国内访问走分发站维护的优选节点 <code>${host}</code>，海外访问走 Cloudflare 默认线路。</small>
-<label id="dnspodField" class="field" hidden>DNSPod Token<small>选填，格式「ID,Token」，在 <a href="https://console.dnspod.cn/account/token/token" target="_blank" rel="noopener">DNSPod 控制台 → API 密钥</a> 创建。填了就自动加两条解析记录；不填会告诉你手动加哪两条。只在这次操作中使用，不保存。</small><input id="dnspod" autocomplete="off" placeholder="12345,0123456789abcdef"></label></div>` : '';
+function renderDeployHtml() {
     const main = `<div class="submit-layout">
 <section>
 <h1>一键部署</h1>
@@ -2592,19 +2372,18 @@ function renderDeployHtml(bestIp = null) {
 ${DEPLOY_TOKEN_FIELDS}
 <label class="field">项目名<small>会成为网址 <code>项目名.pages.dev</code>；小写字母、数字和短横线；被别人用过会自动加后缀</small><input id="project" maxlength="58" required placeholder="my-rph"></label>
 <label class="field">自定义域名<small>选填，例如 rph.example.com；不填就用 pages.dev 网址</small><input id="domain" maxlength="253" placeholder="rph.example.com"></label>
-${bestIpFields}
 <label class="field">存储桶名<small>云同步、图片都存在这里；已有同名桶会直接使用</small><input id="bucket" maxlength="63" required value="rph-data"></label>
 <label class="field">同步密码<small>至少 6 位；以后在站点里同步、管理图片都要用</small><input id="password" type="password" autocomplete="new-password" minlength="6" required></label>
 <p id="status" class="notice" hidden></p>
 <div class="actions"><button id="deploy" class="btn primary" type="submit">部署</button></div>
 </form>
-<div id="done" class="card pad" hidden style="margin-top:20px"><h2>部署完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>。第一次打开可能要等半分钟生效。</p><p class="notes">项目名：<code id="doneName"></code>（原名被占用时会自动加后缀）。</p><div id="doneDomain" class="notes" hidden></div><p class="notes">之后在站点「同步 → 测试版更新」里就能一键更新，不需要再来这里。</p></div>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>部署完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>。第一次打开可能要等半分钟生效。</p><p class="notes">项目名：<code id="doneName"></code>（原名被占用时会自动加后缀）。</p><p id="doneDomain" class="notes" hidden></p><p class="notes">之后在站点「同步 → 测试版更新」里就能一键更新，不需要再来这里。</p></div>
 </section>
 <aside class="card pad side">
 <h2>创建令牌</h2>
 <ol>
 ${DEPLOY_TOKEN_STEPS}
-<li>要用自定义域名，再加两项：区域 → 区域 → 读取、区域 → DNS → 编辑（区域资源选你的域名）。不加也能部署，只是要自己去加 DNS 记录。选「国内优选」时 DNS 在 DNSPod，这两项用不上。</li>
+<li>要用自定义域名，再加两项：区域 → 区域 → 读取、区域 → DNS → 编辑（区域资源选你的域名）。不加也能部署，只是要自己去加 DNS 记录。</li>
 <li>帐户资源选你要部署的帐户，创建后复制令牌。</li>
 </ol>
 ${DEPLOY_TOKEN_USAGE}
@@ -2693,7 +2472,7 @@ function pendingItems(pending){return pending.length?pending.map((item)=>'<li><d
 function bindRetry(){document.querySelectorAll('.retry').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;notice('正在重试 '+button.dataset.tag+'…');try{const result=await api('/api/pending/retry',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice(result.sync?.ok?'重试完成。':'重试已执行，同步仍有错误。',result.sync?.ok?'ok':'error');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}}))}
 function bindDelete(){document.querySelectorAll('.delete-version').forEach((button)=>button.addEventListener('click',async()=>{if(!confirm('确认删除版本 '+button.dataset.tag+'？快照文件一并清理；如果它仍是上游现行 Release，下次同步会重新上架。'))return;button.disabled=true;notice('正在删除 '+button.dataset.tag+'…');try{const result=await api('/api/versions/delete',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice('已删除 '+button.dataset.tag+'（清理快照 '+(result.snapshotsDeleted||0)+' 个）。','ok');await refresh()}catch(error){notice(error.message,'error');button.disabled=false}}))}
 function bindAnnouncements(){document.querySelectorAll('.show-announcement').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;const panel=byId('announcementPanel');panel.textContent='公告加载中…';panel.hidden=false;try{const response=await fetch('/announcements.json?tag='+encodeURIComponent(button.dataset.tag));let value=null;try{value=await response.json()}catch{value=null}panel.textContent='';const head=document.createElement('h3');head.textContent='公告 · '+button.dataset.tag;panel.appendChild(head);if(!response.ok||!value){const message=document.createElement('p');message.textContent=response.status===404?'公告索引尚未生成，请先点一次「同步上游版本」。':'公告加载失败：HTTP '+response.status;panel.appendChild(message)}else{const entry=(Array.isArray(value.entries)?value.entries:[]).find((item)=>item&&item.tag===button.dataset.tag)||null;const body=document.createElement(entry&&entry.announcement?'pre':'p');body.textContent=entry&&entry.announcement?'[ID '+entry.announcement.id+'] '+entry.announcement.title+'\n\n'+entry.announcement.content:'该版本暂无公告'+(entry&&entry.reason?'（'+entry.reason+'）。':'。');panel.appendChild(body)}panel.scrollIntoView({block:'nearest'})}catch(error){panel.textContent='公告加载失败：'+error.message}finally{button.disabled=false}}))}
-function render(status){byId('pageStamp').textContent='状态时间 '+time(Date.now());byId('manifestState').textContent=status.manifest.valid?'正常':'格式无效';byId('updatedAt').textContent=time(status.manifest.updatedAt);byId('counts').textContent=status.manifest.versions.length+' / '+status.manifest.pending.length;const error=status.syncError;byId('syncError').textContent=error?((error.valid?'有同步错误':'错误状态无效')+' · '+time(error.at)):'无';const detail=error&&error.detail?((error.tag?'['+error.tag+'] ':'')+error.detail):'';byId('syncErrorDetail').textContent=detail;byId('syncErrorDetail').hidden=!detail;const progress=status.syncProgress;const box=byId('syncProgress');box.textContent='同步进度：'+(progress?((progress.state==='running'?'进行中':(progress.state==='done'?'已完成':'出错'))+' · 第 '+progress.step+' 步：'+progress.phase+(progress.detail?' — '+progress.detail:'')+' · '+time(progress.at)):'尚未同步过');box.className='notice '+(progress?(progress.state==='running'?'':(progress.state==='done'?'ok':'error')):'');byId('releaseLimit').value=status.config.releaseLimit;byId('webhookEnabled').checked=status.config.webhookEnabled;byId('upstreamRepo').textContent=status.config.upstreamRepo;byId('patchRevision').textContent=status.RP_HUB_APP_PATCH_REVISION;byId('secretGithub').innerHTML=configured(status.secrets.github);byId('secretWebhook').innerHTML=configured(status.secrets.webhook);byId('secretWebhookAuth').innerHTML=configured(status.secrets.webhookAuth);byId('secretAdmin').innerHTML=configured(status.secrets.admin);renderBestIp(status);byId('versionsBody').innerHTML=versionItems(status.manifest.versions);byId('pendingBody').innerHTML=pendingItems(status.manifest.pending);byId('pendingCount').textContent=status.manifest.pending.length?String(status.manifest.pending.length):'';bindRetry();bindDelete();byId('announcementPanel').hidden=true;bindAnnouncements()}
+function render(status){byId('pageStamp').textContent='状态时间 '+time(Date.now());byId('manifestState').textContent=status.manifest.valid?'正常':'格式无效';byId('updatedAt').textContent=time(status.manifest.updatedAt);byId('counts').textContent=status.manifest.versions.length+' / '+status.manifest.pending.length;const error=status.syncError;byId('syncError').textContent=error?((error.valid?'有同步错误':'错误状态无效')+' · '+time(error.at)):'无';const detail=error&&error.detail?((error.tag?'['+error.tag+'] ':'')+error.detail):'';byId('syncErrorDetail').textContent=detail;byId('syncErrorDetail').hidden=!detail;const progress=status.syncProgress;const box=byId('syncProgress');box.textContent='同步进度：'+(progress?((progress.state==='running'?'进行中':(progress.state==='done'?'已完成':'出错'))+' · 第 '+progress.step+' 步：'+progress.phase+(progress.detail?' — '+progress.detail:'')+' · '+time(progress.at)):'尚未同步过');box.className='notice '+(progress?(progress.state==='running'?'':(progress.state==='done'?'ok':'error')):'');byId('releaseLimit').value=status.config.releaseLimit;byId('webhookEnabled').checked=status.config.webhookEnabled;byId('upstreamRepo').textContent=status.config.upstreamRepo;byId('patchRevision').textContent=status.RP_HUB_APP_PATCH_REVISION;byId('secretGithub').innerHTML=configured(status.secrets.github);byId('secretWebhook').innerHTML=configured(status.secrets.webhook);byId('secretWebhookAuth').innerHTML=configured(status.secrets.webhookAuth);byId('secretAdmin').innerHTML=configured(status.secrets.admin);byId('versionsBody').innerHTML=versionItems(status.manifest.versions);byId('pendingBody').innerHTML=pendingItems(status.manifest.pending);byId('pendingCount').textContent=status.manifest.pending.length?String(status.manifest.pending.length):'';bindRetry();bindDelete();byId('announcementPanel').hidden=true;bindAnnouncements()}
 let progressTimer=null;function startProgressPolling(){if(progressTimer)return;progressTimer=setInterval(async()=>{try{const status=await api('/api/status');render(status);if(!status.syncProgress||status.syncProgress.state!=='running'){clearInterval(progressTimer);progressTimer=null}}catch{}},2000)}
 function syncSummary(result){const parts=[];const published=(result.events||[]).filter((event)=>event==='version_published'||event==='retag_republished').length;const failed=(result.events||[]).filter((event)=>event.indexOf('precheck_failed')>=0).length;if(published)parts.push('上架 '+published+' 个上游版本');if(failed)parts.push(failed+' 个预检失败转挂起');if(!published&&!failed)parts.push(result.changed?'状态已更新':'上游无新版本');parts.push('累计 '+result.versionCount+' 个');if(result.snapshotBudget&&result.snapshotBudget.deferred)parts.push('还有版本待回填，请再点一次「同步上游版本」');return parts.join('；')+'。'}
 async function refresh(){try{render(await api('/api/status'))}catch(error){notice(error.message,'error')}}
@@ -2702,9 +2481,6 @@ byId('syncNow').addEventListener('click',async(event)=>{const button=event.curre
 byId('syncTests').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('正在同步测试版…');try{const result=await api('/api/sync/test-releases',{method:'POST'});notice(result.ok?'测试版同步完成：共 '+result.versionCount+' 个。':'测试版同步失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refreshTests()}catch(error){notice('测试版同步失败：'+error.message,'error')}finally{button.disabled=false}});
 byId('webhookTest').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('正在测试 Webhook…');try{const result=await api('/api/webhook-test',{method:'POST'});notice(result.sent?'Webhook 已发送。':(result.disabled?'Webhook 已禁用。':'Webhook 未发送。'),result.sent?'ok':'error')}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
 byId('configForm').addEventListener('submit',async(event)=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{await api('/api/config',{method:'PUT',body:JSON.stringify({releaseLimit:Number(byId('releaseLimit').value),webhookEnabled:byId('webhookEnabled').checked})});notice('配置已保存。','ok');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
-function renderBestIp(status){const best=status.bestIp;byId('bestIpHost').textContent=best.host||'未配置 BEST_IP_HOST';byId('secretBestIp').innerHTML=configured(status.secrets.bestIpDns);byId('bestIpList').textContent=best.ips.length?best.ips.join('、'):'无';byId('bestIpMeta').textContent=(best.source||'—')+' · '+time(best.updatedAt)+' · '+time(best.checkedAt);byId('bestIpError').textContent=best.error;byId('bestIpError').hidden=!best.error;[['bestIpSources',status.config.bestIpSources],['bestIpManual',status.config.bestIpManual]].forEach(([id,list])=>{if(document.activeElement!==byId(id))byId(id).value=list.join('\n')})}
-byId('bestIpForm').addEventListener('submit',async(event)=>{event.preventDefault();const button=event.submitter;button.disabled=true;const lines=(id)=>byId(id).value.split('\n').map((line)=>line.trim()).filter(Boolean);try{await api('/api/config',{method:'PUT',body:JSON.stringify({bestIpSources:lines('bestIpSources'),bestIpManual:lines('bestIpManual')})});notice('优选配置已保存，下次定时任务生效；也可以点「立即更新 DNS」。','ok');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
-byId('bestIpSync').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('正在更新优选 IP…');try{const result=await api('/api/sync/best-ips',{method:'POST'});notice(result.ok?'优选 IP 已更新：'+result.ips.join('、'):'优选 IP 更新失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refresh()}catch(error){notice('优选 IP 更新失败：'+error.message,'error')}finally{button.disabled=false}});
 async function refreshTests(){const box=byId('testsBody');try{const response=await fetch('/test-releases/manifest.json',{cache:'no-store'});if(response.status===404){box.innerHTML='<li class="empty">还没有测试版</li>';return}const value=await response.json();const versions=value.versions||[];box.innerHTML=versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>发布 '+esc(time(item.publishedAt))+'</span><span>发布包 '+kb(item.bundle&&item.bundle.size)+'</span>'+(item.zip?'<span>部署包 '+kb(item.zip.size)+'</span>':'')+'</div><p class="notes small">'+esc(item.notes||'无更新说明')+'</p></div>'+(item.zip?'<a class="btn small" href="'+esc(item.zip.path)+'">部署包</a>':'')+'</li>').join(''):'<li class="empty">还没有测试版</li>'}catch(error){box.innerHTML='<li class="empty">读取失败：'+esc(error.message)+'</li>'}}
 let workshop={pending:[],plugins:[]};let review=null;
 async function refreshWorkshop(){if(!storedToken()){byId('workshopPendingBody').innerHTML='<li class="empty">保存管理员令牌后才能查看投稿</li>';byId('workshopPluginsBody').innerHTML='';return}try{workshop=await api('/api/workshop/pending');renderWorkshop()}catch(error){notice(error.message,'error')}}
@@ -2770,10 +2546,6 @@ function renderConsoleHtml() {
 <section data-panel="settings" class="settings" hidden>
 <div class="card pad"><h2>运行配置</h2><form id="configForm" class="inline-form" style="margin-top:10px"><label for="releaseLimit">保留上游 Release 数</label><input id="releaseLimit" type="number" min="1" max="12" step="1"><label><input id="webhookEnabled" type="checkbox"> 启用 Webhook 通知</label><button class="btn primary" type="submit">保存</button></form><div class="actions" style="margin-top:12px"><button id="webhookTest" class="btn" type="button">测试 Webhook</button></div></div>
 <div class="card pad"><h2>环境</h2><div class="kv"><span>GitHub 令牌</span><span id="secretGithub"></span></div><div class="kv"><span>Webhook 地址</span><span id="secretWebhook"></span></div><div class="kv"><span>Webhook 鉴权</span><span id="secretWebhookAuth"></span></div><div class="kv"><span>管理员令牌</span><span id="secretAdmin"></span></div><div class="kv"><span>上游仓库</span><span id="upstreamRepo"></span></div><div class="kv"><span>补丁修订</span><code id="patchRevision"></code></div></div>
-<div class="card pad"><h2>国内优选</h2><p class="muted small">分发站维护一个优选域名，定时把它的 A 记录换成国内访问快的 Cloudflare 官方节点；用户部署时选「国内优选」，站点的国内线路就 CNAME 到它。需要环境变量 <code>BEST_IP_HOST</code> 和密钥 <code>BEST_IP_DNS_TOKEN</code>（区域 → 区域 → 读取、区域 → DNS → 编辑）。每小时 07 分、37 分随定时任务更新。</p>
-<div class="kv"><span>优选域名</span><code id="bestIpHost"></code></div><div class="kv"><span>DNS 令牌</span><span id="secretBestIp"></span></div><div class="kv"><span>当前 IP</span><span id="bestIpList"></span></div><div class="kv"><span>来源 · 改动 · 检查</span><span id="bestIpMeta"></span></div>
-<div id="bestIpError" class="notice error" hidden></div>
-<form id="bestIpForm" class="form" style="margin-top:12px"><label class="field">来源地址<small>每行一个 https 地址，按顺序试，取第一个给出 Cloudflare 官方网段内 IP 的来源；网段外的 IP 一律丢弃</small><textarea id="bestIpSources"></textarea></label><label class="field">手动指定 IP<small>每行一个；填了就不再拉取来源，清空恢复自动</small><textarea id="bestIpManual"></textarea></label><div class="actions"><button class="btn primary" type="submit">保存</button><button id="bestIpSync" class="btn" type="button">立即更新 DNS</button></div></form></div>
 </section>`;
     return renderShell({ title: '管理', active: '/admin', main, css: ADMIN_CSS, script: ADMIN_SCRIPT });
 }
@@ -3171,7 +2943,7 @@ async function handleRequest(request, env, options = {}) {
         }
     }
     if (request.method === 'GET' && (url.pathname === '/deploy' || url.pathname === '/migrate')) {
-        return new Response(url.pathname === '/deploy' ? renderDeployHtml(await readBestIpState(env.MIRROR_BUCKET)) : renderMigrateHtml(), {
+        return new Response(url.pathname === '/deploy' ? renderDeployHtml() : renderMigrateHtml(), {
             headers: {
                 'cache-control': 'no-store',
                 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
@@ -3182,7 +2954,7 @@ async function handleRequest(request, env, options = {}) {
             }
         });
     }
-    if (request.method === 'POST' && ['/api/deploy', '/api/deploy/accounts', '/api/deploy/sites', '/api/deploy/migrate', '/api/deploy/domain'].includes(url.pathname)) {
+    if (request.method === 'POST' && ['/api/deploy', '/api/deploy/accounts', '/api/deploy/sites', '/api/deploy/migrate'].includes(url.pathname)) {
         return handleDeployApi(request, env, runtimeOptions, url.pathname.split('/')[3] || 'deploy');
     }
     if (request.method === 'GET' && url.pathname === '/workshop/submit') {
@@ -3224,7 +2996,7 @@ async function handleRequest(request, env, options = {}) {
         }
     }
     const writeRoute = (
-        (request.method === 'POST' && ['/api/sync', '/api/sync/test-releases', '/api/sync/best-ips', '/api/pending/retry', '/api/versions/delete', '/api/webhook-test'].includes(url.pathname))
+        (request.method === 'POST' && ['/api/sync', '/api/sync/test-releases', '/api/pending/retry', '/api/versions/delete', '/api/webhook-test'].includes(url.pathname))
         || (request.method === 'PUT' && url.pathname === '/api/config')
     );
     if (writeRoute) {
@@ -3233,7 +3005,6 @@ async function handleRequest(request, env, options = {}) {
         try {
             if (url.pathname === '/api/sync') return jsonResponse(await syncMirror(env, runtimeOptions));
             if (url.pathname === '/api/sync/test-releases') return jsonResponse(await syncTestReleasesSafely(env, runtimeOptions));
-            if (url.pathname === '/api/sync/best-ips') return jsonResponse(await syncBestIps(env, runtimeOptions));
             if (url.pathname === '/api/pending/retry') return await retryPending(request, env, runtimeOptions);
             if (url.pathname === '/api/versions/delete') return await deleteVersion(request, env, runtimeOptions);
             if (url.pathname === '/api/config') return await updateRuntimeConfig(request, env);
@@ -3265,9 +3036,6 @@ export default {
         }));
         ctx.waitUntil(syncTestReleasesSafely(env).then((result) => {
             console.log(JSON.stringify({ message: 'test release scheduled sync complete', cron: controller.cron, ...result }));
-        }));
-        ctx.waitUntil(syncBestIps(env).then((result) => {
-            console.log(JSON.stringify({ message: 'best ip sync complete', cron: controller.cron, ...result }));
         }));
     }
 };
