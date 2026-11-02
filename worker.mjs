@@ -1,8 +1,10 @@
 
 import {
     patchRpHubAppJs,
+    patchRpHubCloudBackupJs,
     RpHubAppPatchError,
-    RP_HUB_APP_PATCH_REVISION
+    RP_HUB_APP_PATCH_REVISION,
+    RP_HUB_CLOUD_BACKUP_PATH
 } from './lib/app-patches.mjs';
 
 const DEFAULT_UPSTREAM_REPO = 'STA1N156/RP-Hub';
@@ -743,6 +745,9 @@ async function buildVersionSnapshotFromFiles(bucket, release, commit, files, ann
     if (nonAppTotalBytes + patchedAppJs.byteLength > MAX_APP_UPDATE_TOTAL_BYTES) {
         throw new ReleaseIncompleteError('上游文件总大小超过限制（160MiB），已停止更新。');
     }
+    // 2.0.4 起的云端备份脚本也要能打上补丁，否则站点更新时会被拒。
+    const cloudBackupBytes = files.get(RP_HUB_CLOUD_BACKUP_PATH);
+    if (cloudBackupBytes) patchRpHubCloudBackupJs(new TextDecoder().decode(cloudBackupBytes), { version: release.tag });
     return {
         tag: release.tag,
         commit,

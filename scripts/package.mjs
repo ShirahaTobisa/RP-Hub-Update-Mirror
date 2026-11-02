@@ -3,7 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const APP_PATCH_IMPORT = /^import\s*\{\s*patchRpHubAppJs\s*,\s*RpHubAppPatchError\s*,\s*RP_HUB_APP_PATCH_REVISION\s*\}\s*from\s*['"]\.\/lib\/app-patches\.mjs['"]\s*;\s*/;
+const APP_PATCH_IMPORT_NAMES = [
+    'patchRpHubAppJs', 'patchRpHubCloudBackupJs', 'RpHubAppPatchError', 'RP_HUB_APP_PATCH_REVISION', 'RP_HUB_CLOUD_BACKUP_PATH'
+];
+const APP_PATCH_IMPORT = new RegExp(`^import\\s*\\{\\s*${APP_PATCH_IMPORT_NAMES.join('\\s*,\\s*')}\\s*\\}\\s*from\\s*['"]\\.\\/lib\\/app-patches\\.mjs['"]\\s*;\\s*`);
 const MODULE_EXPORT = /^export\s+(const|class|function)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/gm;
 const EXPECTED_MODULE_EXPORTS = [
     'const:RP_HUB_APP_PATH',
@@ -11,7 +14,10 @@ const EXPECTED_MODULE_EXPORTS = [
     'const:APP_PATCH_MODES',
     'class:RpHubAppPatchError',
     'function:verifyRpHubAppJs',
-    'function:patchRpHubAppJs'
+    'function:patchRpHubAppJs',
+    'const:RP_HUB_CLOUD_BACKUP_PATH',
+    'const:RP_HUB_CLOUD_BACKUP_META_NAME',
+    'function:patchRpHubCloudBackupJs'
 ];
 const STATIC_IMPORT = /^\s*import\b/m;
 const ANY_EXPORT = /^\s*export\s+/gm;
@@ -62,9 +68,9 @@ function inlineAppPatcher(workerSource, patcherSource) {
 
     const inlinedModule = [
         '// Inlined from lib/app-patches.mjs by scripts/package.mjs.',
-        'const { patchRpHubAppJs, RpHubAppPatchError, RP_HUB_APP_PATCH_REVISION } = (() => {',
+        `const { ${APP_PATCH_IMPORT_NAMES.join(', ')} } = (() => {`,
         patcherBody,
-        'return { patchRpHubAppJs, RpHubAppPatchError, RP_HUB_APP_PATCH_REVISION };',
+        `return { ${APP_PATCH_IMPORT_NAMES.join(', ')} };`,
         '})();',
         ''
     ].join('\n');
