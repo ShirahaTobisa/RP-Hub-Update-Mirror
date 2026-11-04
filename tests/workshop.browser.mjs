@@ -25,7 +25,8 @@ const browser = await chromium.launch({ headless: true, ...(process.env.CHROME_P
 const page = await browser.newPage();
 const errors = [];
 page.on('pageerror', (error) => errors.push(error.message));
-page.on('dialog', (dialog) => dialog.accept());
+page.on('dialog', (dialog) => { errors.push('browser dialog: ' + dialog.message()); dialog.dismiss(); });
+const confirmAsk = () => page.click('dialog.ask .btn.primary');
 
 async function submit(source, { name = '', author = '' } = {}) {
     await page.goto(`${base}/workshop/submit`);
@@ -57,6 +58,7 @@ try {
     await page.waitForFunction(() => document.querySelector('#reviewCode').textContent.includes('browser-demo'));
     assert.equal(await page.isHidden('#viewDiff'), true, 'a new plugin has nothing to compare');
     await page.click('#reviewApprove');
+    await confirmAsk();
     await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('browser-demo'));
     assert.deepEqual((await (await fetch(`${base}/workshop/index.json`)).json()).plugins.map((plugin) => plugin.version), ['1.0.0']);
     console.log('PASS admin reviews the full source and publishes the submission');
@@ -75,10 +77,12 @@ try {
     assert.equal(await page.locator('#reviewCode .ln.add').count(), 2);
     assert.equal(await page.locator('#reviewCode .ln.del').count(), 1);
     await page.click('#reviewApprove');
+    await confirmAsk();
     await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('v1.1.0'));
     console.log('PASS updates are detected on submit and reviewed as a diff against the published version');
 
     await page.locator('.ws-remove').click();
+    await confirmAsk();
     await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('工坊里还没有插件'));
     assert.deepEqual(errors, []);
     console.log('PASS admin page removes a published plugin');
