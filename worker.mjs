@@ -1992,7 +1992,7 @@ textarea{min-height:96px;resize:vertical}
 .form{display:grid;gap:16px}.form p{margin:0}
 .footer{padding:20px 0 32px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
 .footer code{font-size:12px}
-@media(max-width:640px){.wrap{width:calc(100% - 24px)}h1{font-size:22px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stat{padding:10px 12px}.stat span{font-size:12px}.stat b{font-size:14px}.topbar-inner{flex-direction:column;align-items:flex-start;gap:6px;padding:10px 0}.list>li{padding:12px}.pad{padding:14px}}
+@media(max-width:640px){.wrap{width:calc(100% - 24px)}h1{font-size:22px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stat{padding:10px 12px}.stat span{font-size:12px}.stat b{font-size:14px}.topbar-inner{flex-direction:column;align-items:flex-start;gap:6px;padding:10px 0}.site-nav{max-width:100%}.list>li{padding:12px}.pad{padding:14px}}
 `;
 
 // ---- 一键部署：用用户的 Cloudflare 令牌创建 Pages 项目和 R2 存储桶，部署最新测试版 ----
@@ -2480,7 +2480,7 @@ async function api(path,options={}){const headers=new Headers(options.headers||{
 function renderAuth(){const signedIn=Boolean(storedToken());byId('authForm').hidden=signedIn;byId('authState').hidden=!signedIn}
 byId('authForm').addEventListener('submit',(event)=>{event.preventDefault();const token=byId('adminToken').value.trim();if(!token)return;localStorage.setItem('mirrorAdminToken',token);byId('adminToken').value='';renderAuth();notice('管理员令牌已保存到此浏览器。','ok');refreshWorkshop()});
 byId('logout').addEventListener('click',()=>{localStorage.removeItem('mirrorAdminToken');renderAuth();notice('已退出，令牌已从此浏览器删除。')});
-function showTab(name){if(!document.querySelector('[data-panel="'+name+'"]'))name='overview';document.querySelectorAll('[data-tab]').forEach((button)=>button.setAttribute('aria-selected',String(button.dataset.tab===name)));document.querySelectorAll('[data-panel]').forEach((panel)=>{panel.hidden=panel.dataset.panel!==name});history.replaceState(null,'','#'+name);if(name==='tests')refreshTests();if(name==='workshop')refreshWorkshop()}
+function showTab(name){if(!document.querySelector('[data-panel="'+name+'"]'))name='overview';document.querySelectorAll('[data-tab]').forEach((button)=>button.setAttribute('aria-selected',String(button.dataset.tab===name)));document.querySelector('[data-tab="'+name+'"]').scrollIntoView({block:'nearest',inline:'nearest'});document.querySelectorAll('[data-panel]').forEach((panel)=>{panel.hidden=panel.dataset.panel!==name});history.replaceState(null,'','#'+name);if(name==='tests')refreshTests();if(name==='workshop')refreshWorkshop();if(name==='feedback')refreshFeedback()}
 document.querySelectorAll('[data-tab]').forEach((button)=>button.addEventListener('click',()=>showTab(button.dataset.tab)));window.addEventListener('hashchange',()=>showTab(location.hash.slice(1)));
 function versionItems(versions){return versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>commit <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>收录 '+esc(time(item.publishedAt))+'</span><span>'+Number(item.fileCount||0)+' 个文件</span></div></div><div class="actions"><button class="btn small show-announcement" data-tag="'+esc(item.tag)+'">公告</button><button class="btn small danger delete-version" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">删除</button></div></li>').join(''):'<li class="empty">尚无已发布版本</li>'}
 function pendingItems(pending){return pending.length?pending.map((item)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> <span class="badge warn">'+esc(item.reason)+'</span><div class="meta"><span>commit <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>发现 '+esc(time(item.seenAt))+'</span></div><div class="notes small muted">'+esc(item.detail)+'</div></div><button class="btn small retry" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">重试</button></li>').join(''):'<li class="empty">没有挂起的版本</li>'}
@@ -2508,6 +2508,88 @@ function diffLines(a,b){let start=0;while(start<a.length&&start<b.length&&a[star
 function renderDiff(oldText,newText){const ops=diffLines(oldText.split('\n'),newText.split('\n'));const keep=new Uint8Array(ops.length);let added=0,removed=0;ops.forEach((op,index)=>{if(op[0]==='+')added++;if(op[0]==='-')removed++;if(op[0]!=='=')for(let d=-3;d<=3;d++)if(index+d>=0&&index+d<ops.length)keep[index+d]=1});if(!added&&!removed)return '<div class="empty">代码和已上架版本完全相同</div>';let html='<div class="diff-sum"><span class="badge ok">+'+added+' 行</span> <span class="badge danger">-'+removed+' 行</span> <span class="muted small">只显示改动和前后 3 行</span></div>',skipped=0;const gap=()=>{if(skipped)html+='<div class="ln gap"><span></span><code>… 省略 '+skipped+' 行未改动 …</code></div>';skipped=0};ops.forEach((op,index)=>{if(!keep[index]){skipped++;return}gap();html+='<div class="ln'+(op[0]==='+'?' add':op[0]==='-'?' del':'')+'"><span>'+(op[0]==='-'?op[2]:op[3])+'</span><code>'+(op[0]==='='?' ':op[0])+' '+esc(op[1])+'</code></div>'});gap();return html}
 async function decide(action){if(!review)return;const label=action==='approve'?'上架':'拒绝';if(!await ask(action==='approve'?'确认上架？插件会拥有安装它的站点的全部权限。':'确认拒绝这条投稿？投稿文件会被删除。'))return;try{const result=await api('/api/workshop/'+action,{method:'POST',body:JSON.stringify({sid:review.item.sid})});byId('reviewPanel').hidden=true;review=null;await refreshWorkshop();notice(action==='approve'?'已上架 '+result.published.id+' v'+result.published.version+'。':'已'+label+'。','ok')}catch(error){notice(label+'失败：'+error.message,'error')}}
 byId('reviewApprove').addEventListener('click',()=>decide('approve'));byId('reviewReject').addEventListener('click',()=>decide('reject'));byId('reviewClose').addEventListener('click',()=>{byId('reviewPanel').hidden=true});byId('workshopRefresh').addEventListener('click',async()=>{await refreshWorkshop();notice('工坊已刷新。','ok')});
+let feedbackCursor = '', feedbackSelected = null;
+const issueNames = { image: '图片不对', save: '保存失败', sync: '同步异常', voice: '朗读异常', startup: '打不开或卡住', other: '其他问题' };
+const clock = value => new Date(Number(value)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+// 运行记录按一行一条显示，最新的在前；原始 JSON 折叠在下面。
+const eventLine = event => clock(event.at) + '  ' + [event.kind, event.errorName, event.status && 'HTTP ' + event.status, event.plugin,
+    event.owner && '所属 ' + event.owner, event.current && '当前 ' + event.current, Number.isFinite(event.count) && event.count + ' 条消息'].filter(Boolean).join('  ')
+    + (event.frames || []).map(frame => '\n    ' + frame).join('');
+function closeFeedback() {
+    feedbackSelected = null;
+    byId('feedbackDetail').hidden = true;
+    byId('feedbackPreview').textContent = '';
+}
+function clearFeedback() {
+    closeFeedback();
+    byId('feedbackStats').querySelectorAll('[data-feedback-count]').forEach(item => { item.textContent = '—'; });
+    byId('feedbackHint').textContent = '保存管理员令牌后可查看。';
+    byId('feedbackVersions').replaceChildren();
+    byId('feedbackReports').replaceChildren();
+    byId('feedbackNext').hidden = true;
+}
+async function loadFeedbackReports(cursor = '') {
+    const data = await api('/api/feedback/reports' + (cursor ? '?cursor=' + encodeURIComponent(cursor) : ''));
+    feedbackCursor = data.cursor;
+    byId('feedbackNext').hidden = !feedbackCursor;
+    const items = data.reports.map(item => '<li><div class="grow"><b>' + esc(issueNames[item.issue] || item.issue) + '</b> '
+        + (item.release ? '<span class="badge">' + esc(item.release) + '</span>' : '') + '<div class="meta"><span>' + esc(time(item.at)) + '</span><code>' + esc(item.id) + '</code></div></div>'
+        + '<button class="btn small" type="button" data-report="' + esc(item.id) + '">查看</button></li>').join('');
+    if (cursor) byId('feedbackReports').insertAdjacentHTML('beforeend', items);
+    else byId('feedbackReports').innerHTML = items || '<li class="empty">还没有收到报告</li>';
+}
+async function refreshFeedback() {
+    clearFeedback();
+    if (!storedToken()) return;
+    try {
+        const stats = await api('/api/feedback/stats');
+        byId('feedbackStats').querySelectorAll('[data-feedback-count]').forEach(item => { item.textContent = stats[item.dataset.feedbackCount]; });
+        byId('feedbackHint').textContent = '同一账户的多个站点只算一个；没开统计或没送达的不计入。今日按 UTC 计算。';
+        const versions = Object.entries(stats.versions).sort((a, b) => b[1] - a[1]);
+        byId('feedbackVersions').innerHTML = '<span>近 30 天版本</span>' + (versions.map(([version, count]) => '<span class="badge primary">' + esc(version || '未知') + ' · ' + count + '</span>').join('') || '<span>暂无</span>');
+        await loadFeedbackReports();
+    } catch (error) { notice(error.message, 'error'); }
+}
+async function openFeedback(id) {
+    try {
+        const report = await api('/api/feedback/reports/' + encodeURIComponent(id));
+        const errors = report.events.filter(event => /error|rejection/.test(event.kind)).length;
+        feedbackSelected = report;
+        byId('feedbackTitle').textContent = issueNames[report.issue] || report.issue;
+        byId('feedbackMeta').innerHTML = '<span>编号 <code>' + esc(report.id) + '</code></span><span>收到 ' + esc(time(report.receivedAt)) + '</span><span>' + esc(report.release) + (report.upstream ? ' · 官方 ' + esc(report.upstream) : '')
+            + '</span><span>' + report.events.length + ' 条记录' + (errors ? '，' + errors + ' 条报错' : '') + '</span>';
+        byId('feedbackNote').textContent = report.note || '没有填写补充说明。';
+        byId('feedbackNote').classList.toggle('muted', !report.note);
+        byId('feedbackEnv').textContent = '浏览器：' + report.browser + '\n插件：' + (report.plugins.map(item => item.id + ' ' + item.version + (item.status ? '（' + item.status + '）' : '')).join('、') || '无');
+        byId('feedbackEvents').textContent = report.events.slice().reverse().map(eventLine).join('\n') || '没有运行记录。';
+        byId('feedbackPreview').textContent = JSON.stringify(report, null, 2);
+        byId('feedbackDetail').hidden = false;
+        byId('feedbackDetail').scrollIntoView({ block: 'nearest' });
+    } catch (error) { notice(error.message, 'error'); }
+}
+byId('feedbackRefresh').onclick = refreshFeedback;
+byId('feedbackNext').onclick = () => loadFeedbackReports(feedbackCursor).catch(error => notice(error.message, 'error'));
+byId('feedbackReports').onclick = event => { const button = event.target.closest('[data-report]'); if (button) openFeedback(button.dataset.report); };
+byId('feedbackFind').onsubmit = event => {
+    event.preventDefault();
+    const id = byId('feedbackId').value.trim().toLowerCase();
+    if (/^[a-z0-9]{9}-[a-f0-9]{8}$/.test(id)) openFeedback(id); else notice('编号格式不对，应类似 2wpj4xcha-f9dede2e。', 'warn');
+};
+byId('feedbackClose').onclick = closeFeedback;
+byId('feedbackDelete').onclick = async () => {
+    if (!feedbackSelected || !await ask('删除报告 ' + feedbackSelected.id + '？删除后不能恢复。')) return;
+    try { await api('/api/feedback/reports/' + feedbackSelected.id, { method: 'DELETE' }); notice('报告已删除。', 'ok'); await refreshFeedback(); }
+    catch (error) { notice(error.message, 'error'); }
+};
+byId('feedbackDownload').onclick = () => {
+    if (!feedbackSelected) return;
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([JSON.stringify(feedbackSelected, null, 2)], { type: 'application/json' }));
+    link.download = 'rph-report-' + feedbackSelected.id + '.json';
+    link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+};
+byId('logout').addEventListener('click', clearFeedback);
+byId('authForm').addEventListener('submit', () => { if (location.hash === '#feedback') refreshFeedback(); });
 renderAuth();refresh();showTab(location.hash.slice(1)||'overview');if(storedToken())refreshWorkshop();
 `;
 
@@ -2524,6 +2606,7 @@ function renderConsoleHtml() {
 <button type="button" role="tab" data-tab="upstream">上游版本<span id="pendingCount" class="count"></span></button>
 <button type="button" role="tab" data-tab="tests">测试版</button>
 <button type="button" role="tab" data-tab="workshop">插件审核<span id="workshopCount" class="count"></span></button>
+<button type="button" role="tab" data-tab="feedback">使用与反馈</button>
 <button type="button" role="tab" data-tab="settings">设置</button>
 </div>
 <section data-panel="overview" class="panel-grid">
@@ -2557,6 +2640,28 @@ function renderConsoleHtml() {
 <div class="actions" style="margin-top:12px"><button id="reviewApprove" class="btn primary" type="button">上架</button><button id="reviewReject" class="btn danger" type="button">拒绝</button></div>
 </div>
 <div><h2>已上架插件</h2><ul id="workshopPluginsBody" class="list card"></ul></div>
+</section>
+<section data-panel="feedback" class="panel-grid" hidden>
+<div class="block-head" style="margin:0"><div><h2>活跃 Cloudflare 账户</h2><p id="feedbackHint" class="muted small">保存管理员令牌后可查看。</p></div><button id="feedbackRefresh" class="btn" type="button">刷新</button></div>
+<div id="feedbackStats" class="metrics">
+<div class="stat"><span>今日</span><b data-feedback-count="today">—</b></div>
+<div class="stat"><span>近 7 天</span><b data-feedback-count="week">—</b></div>
+<div class="stat"><span>近 30 天</span><b data-feedback-count="month">—</b></div>
+<div class="stat"><span>累计有记录</span><b data-feedback-count="total">—</b></div>
+</div>
+<div id="feedbackVersions" class="meta"></div>
+<div><h2>问题报告</h2><form id="feedbackFind" class="inline-form"><input id="feedbackId" class="grow" required autocomplete="off" placeholder="输入用户转来的报告编号" aria-label="报告编号"><button class="btn" type="submit">查找</button></form></div>
+<div id="feedbackDetail" class="card pad" hidden>
+<div class="review-head"><h2 id="feedbackTitle"></h2><button id="feedbackClose" class="btn small" type="button">关闭</button></div>
+<div id="feedbackMeta" class="meta"></div>
+<p id="feedbackNote" class="notes"></p>
+<p id="feedbackEnv" class="notes small muted"></p>
+<pre id="feedbackEvents" class="code pad notes"></pre>
+<details class="more"><summary>原始 JSON</summary><pre id="feedbackPreview" class="code pad notes"></pre></details>
+<div class="actions" style="margin-top:12px"><button id="feedbackDownload" class="btn" type="button">下载 JSON</button><button id="feedbackDelete" class="btn danger" type="button">删除报告</button></div>
+</div>
+<ul id="feedbackReports" class="list card"></ul>
+<button id="feedbackNext" class="btn" type="button" hidden>加载更多</button>
 </section>
 <section data-panel="settings" class="settings" hidden>
 <div class="card pad"><h2>运行配置</h2><form id="configForm" class="inline-form" style="margin-top:10px"><label for="releaseLimit">保留上游 Release 数</label><input id="releaseLimit" type="number" min="1" max="12" step="1"><label><input id="webhookEnabled" type="checkbox"> 启用 Webhook 通知</label><button class="btn primary" type="submit">保存</button></form><div class="actions" style="margin-top:12px"><button id="webhookTest" class="btn" type="button">测试 Webhook</button></div></div>
@@ -2866,6 +2971,108 @@ async function updateRuntimeConfig(request, env) {
     return jsonResponse({ ok: true, config });
 }
 
+// 使用统计按账户摘要覆盖最后活跃时间；报告只在用户主动发送时保存，读取沿用管理员令牌。
+const FEEDBACK_USAGE_PREFIX = '_feedback/usage/';
+const FEEDBACK_REPORT_PREFIX = '_feedback/reports/';
+const FEEDBACK_REPORT_ID = /^[a-z0-9]{9}-[a-f0-9]{8}$/;
+const FEEDBACK_ISSUES = new Set(['other', 'image', 'save', 'sync', 'voice', 'startup']);
+
+function feedbackText(value, max) {
+    return typeof value === 'string' ? value.slice(0, max) : '';
+}
+
+function feedbackReport(body) {
+    if (body?.schema !== 1 || !Array.isArray(body.events) || !Array.isArray(body.plugins)
+        || !FEEDBACK_ISSUES.has(body.issue) || body.events.length > 300 || body.plugins.length > 100) {
+        throw new Error('报告格式无效。');
+    }
+    return { schema: 1, release: feedbackText(body.release, 40), upstream: feedbackText(body.upstream, 40),
+        browser: feedbackText(body.browser, 250), issue: body.issue, note: feedbackText(body.note, 500),
+        plugins: body.plugins.map(item => ({ id: feedbackText(item.id, 32), version: feedbackText(item.version, 40), status: feedbackText(item.status, 30) })),
+        events: body.events.map(item => {
+            const event = { at: Number(item.at) || 0, session: feedbackText(item.session, 8), kind: feedbackText(item.kind, 40) };
+            for (const key of ['owner', 'current']) if (/^C\d+$/.test(item[key] || '')) event[key] = item[key];
+            for (const key of ['count', 'status']) if (Number.isFinite(item[key])) event[key] = item[key];
+            for (const key of ['plugin', 'errorName']) if (item[key]) event[key] = feedbackText(item[key], 60);
+            if (Array.isArray(item.frames)) event.frames = item.frames.slice(0, 8).map(frame => feedbackText(frame, 150));
+            return event;
+        }) };
+}
+
+async function feedbackStats(bucket) {
+    const now = Date.now(), today = new Date(now).toISOString().slice(0, 10);
+    const stats = { today: 0, week: 0, month: 0, total: 0, versions: Object.create(null) };
+    let cursor;
+    do {
+        const page = await bucket.list({ prefix: FEEDBACK_USAGE_PREFIX, cursor, include: ['customMetadata'] });
+        for (const object of page.objects) {
+            const { at = '0', release = '' } = object.customMetadata || {};
+            const age = now - Number(at);
+            stats.total++;
+            if (new Date(Number(at)).toISOString().slice(0, 10) === today) stats.today++;
+            if (age < 7 * 86400000) stats.week++;
+            if (age < 30 * 86400000) {
+                stats.month++;
+                stats.versions[release] = (stats.versions[release] || 0) + 1;
+            }
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    return stats;
+}
+
+async function handleFeedbackRequest(request, env, url) {
+    const route = url.pathname.slice('/api/feedback/'.length), bucket = env.MIRROR_BUCKET;
+    const intake = request.method === 'POST' && (route === 'usage' || route === 'reports');
+    if (!intake) {
+        const forbidden = await authorizeWrite(request, env);
+        if (forbidden) return forbidden;
+    }
+    try {
+        if (intake) {
+            const body = await readJsonRequest(request, route === 'usage' ? 1024 : 128 * 1024);
+            const at = Date.now();
+            if (route === 'usage') {
+                if (!/^[a-f0-9]{64}$/.test(body?.account || '') || !/^[\w.-]{1,40}$/.test(body.release || '')
+                    || !/^[\w.-]{1,40}$/.test(body.upstream || '')) throw new Error('统计格式无效。');
+                await bucket.put(FEEDBACK_USAGE_PREFIX + body.account, '', {
+                    customMetadata: { at: String(at), release: body.release, upstream: body.upstream }
+                });
+                return jsonResponse({ ok: true });
+            }
+            const report = feedbackReport(body);
+            // 反向时间作前缀，R2 按键排列时新报告自然在前；不用另写一份容易冲突的列表。
+            const id = (9999999999999 - at).toString(36).padStart(9, '0') + '-' + crypto.randomUUID().slice(0, 8);
+            await bucket.put(FEEDBACK_REPORT_PREFIX + id, JSON.stringify({ ...report, id, receivedAt: at }), {
+                httpMetadata: { contentType: 'application/json' },
+                customMetadata: { at: String(at), release: report.release, issue: report.issue }
+            });
+            return jsonResponse({ ok: true, id });
+        }
+        if (request.method === 'GET' && route === 'stats') return jsonResponse({ ok: true, ...await feedbackStats(bucket) });
+        if (request.method === 'GET' && route === 'reports') {
+            const page = await bucket.list({ prefix: FEEDBACK_REPORT_PREFIX, limit: 50,
+                cursor: url.searchParams.get('cursor') || undefined, include: ['customMetadata'] });
+            return jsonResponse({ ok: true, reports: page.objects.map(object => ({ id: object.key.slice(FEEDBACK_REPORT_PREFIX.length), ...object.customMetadata })),
+                cursor: page.truncated ? page.cursor : '' });
+        }
+        if (route.startsWith('reports/') && FEEDBACK_REPORT_ID.test(route.slice('reports/'.length))) {
+            const key = FEEDBACK_REPORT_PREFIX + route.slice('reports/'.length);
+            if (request.method === 'GET') {
+                const object = await bucket.get(key);
+                return object ? new Response(object.body, { headers: JSON_HEADERS }) : jsonResponse({ ok: false, error: '报告不存在。' }, { status: 404 });
+            }
+            if (request.method === 'DELETE') {
+                await bucket.delete(key);
+                return jsonResponse({ ok: true });
+            }
+        }
+        return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404 });
+    } catch (error) {
+        return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 400 });
+    }
+}
+
 async function handleRequest(request, env, options = {}) {
     if (request.method === 'GET' && isRawSnapshotTraversal(request)) {
         return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404 });
@@ -2875,6 +3082,7 @@ async function handleRequest(request, env, options = {}) {
         fetchImpl: options.fetchImpl || fetch,
         now: options.now || Date.now
     };
+    if (url.pathname.startsWith('/api/feedback/')) return handleFeedbackRequest(request, env, url);
     if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true, service: 'rp-hub-update-mirror' });
     }
