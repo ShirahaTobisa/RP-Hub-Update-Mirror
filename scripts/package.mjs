@@ -23,7 +23,7 @@ const STATIC_IMPORT = /^\s*import\b/m;
 const ANY_EXPORT = /^\s*export\s+/gm;
 const DEFAULT_EXPORT = /^\s*export\s+default\b/gm;
 // 测试要用的函数：打包时去掉 export，只保留 export default。
-const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases', 'submitWorkshopPlugin', 'readPluginManifest'];
+const SYNC_EXPORT_NAMES = ['syncMirror', 'syncTestReleases', 'submitWorkshopPlugin', 'readPluginManifest', 'submitSkin', 'readSkinPackage'];
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const sourceRoot = path.resolve(scriptDirectory, '..');

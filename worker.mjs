@@ -1694,14 +1694,15 @@ async function readWorkshopPlugins(bucket) {
 }
 
 async function serveWorkshop(pathname, env) {
-    const isIndex = pathname === `/${WORKSHOP_INDEX_KEY}`;
-    if (!isIndex && !WORKSHOP_PLUGIN_PATH_PATTERN.test(pathname)) return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404, headers: CORS_HEADERS });
+    const isIndex = pathname === `/${WORKSHOP_INDEX_KEY}` || pathname === `/${SKIN_INDEX_KEY}`;
+    if (!isIndex && !WORKSHOP_PLUGIN_PATH_PATTERN.test(pathname) && !SKIN_FILE_PATTERN.test(pathname)) return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404, headers: CORS_HEADERS });
     const object = await env.MIRROR_BUCKET.get(pathname.slice(1));
     if (!object) return jsonResponse({ ok: false, error: 'Not found.' }, { status: 404, headers: CORS_HEADERS });
     return new Response(object.body, {
         headers: {
             ...CORS_HEADERS,
-            'cache-control': isIndex ? 'public, max-age=60' : 'public, max-age=300',
+            // 皮肤包每次都回源核对（站点按目录里的指纹校验，旧缓存会对不上）；封面图可以缓存一会儿。
+            'cache-control': isIndex ? 'public, max-age=60' : pathname.endsWith('.json') ? 'no-cache' : 'public, max-age=300',
             'content-type': object.httpMetadata?.contentType || 'application/octet-stream',
             'x-content-type-options': 'nosniff'
         }
@@ -1759,6 +1760,212 @@ function renderWorkshopSubmitHtml() {
     const css = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:4px 0}.field{display:grid;gap:6px;font-weight:600}.drop{display:flex;align-items:center;gap:14px;padding:16px 18px;border:1.5px dashed var(--line);border-radius:12px;background:var(--surface-2);font-weight:400;cursor:pointer;transition:border-color .15s,background .15s}.drop:hover,.drop.dragging{border-color:var(--primary);background:var(--primary-soft)}.drop.chosen{border-style:solid}.drop:focus-within{outline:2px solid color-mix(in srgb,var(--primary) 45%,transparent);outline-offset:2px}.drop-icon{display:grid;place-items:center;flex:none;width:40px;height:40px;border-radius:10px;background:var(--primary);color:#fff}.drop-text{display:grid;min-width:0}.drop-text b{overflow-wrap:anywhere}.drop-text small{color:var(--muted)}.visually-hidden{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden}.detected{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-radius:10px;background:var(--surface-2)}@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
     return renderShell({ title: '投稿插件', active: '/workshop/submit', main, css, script: SUBMIT_SCRIPT });
 }
+
+// ---- 皮肤工坊：皮肤包只有图和颜色、不带代码。投稿进待审核区，管理员在 /admin 看过图再上架；测试版站点的「皮肤」插件从这里下载 ----
+const SKIN_PREFIX = `${WORKSHOP_PREFIX}/skins`;
+const SKIN_INDEX_KEY = `${SKIN_PREFIX}/index.json`;
+const SKIN_PENDING_PREFIX = `${WORKSHOP_PREFIX}/skin-pending/`;
+const SKIN_FILE_PATTERN = /^\/workshop\/skins\/([a-z0-9-]{3,32})\.(json|webp|png|jpg)$/;
+const SKIN_PENDING_SOURCE_PATTERN = /^\/api\/workshop\/skins\/pending\/([a-f0-9-]{36})\.json$/;
+const SKIN_KEYS = ['schema', 'id', 'version', 'name', 'note', 'accent', 'neutral', 'colors', 'art', 'wide', 'icons'];
+// 图一律是 data 地址；横图末尾可以带 #left / #right，说明人物在哪边。
+const SKIN_IMAGE_PATTERN = /^data:image\/(webp|png|jpeg);base64,[A-Za-z0-9+/]+={0,2}(#(?:left|right))?$/;
+const HEX_COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
+const SKIN_TEXT_LIMITS = { author: 40, description: 300, contact: 100 };
+const MAX_SKIN_BYTES = 8 * 1024 * 1024;
+
+// 皮肤包格式（schema 1）：{ schema, id, version, name, note, accent, neutral, colors, art: [竖图], wide: [横图], icons: 6 列 4 行图标表 }。
+export function readSkinPackage(text) {
+    let skin;
+    try { skin = JSON.parse(text); } catch { throw new WorkshopRequestError('皮肤包不是有效的 JSON'); }
+    if (!plainObject(skin) || skin.schema !== 1) throw new WorkshopRequestError('皮肤包格式不对：schema 要是 1');
+    const unknown = Object.keys(skin).filter((key) => !SKIN_KEYS.includes(key));
+    if (unknown.length) throw new WorkshopRequestError(`皮肤包只收图和颜色，不能带 ${unknown.join('、')}`);
+    const images = (value, min, max) => Array.isArray(value) && value.length >= min && value.length <= max
+        && value.every((item) => typeof item === 'string' && SKIN_IMAGE_PATTERN.test(item));
+    const fail = (message) => { throw new WorkshopRequestError(message); };
+    checkSkinLabels(skin);
+    if (typeof skin.version !== 'string' || !skin.version.trim() || skin.version.length > 32) fail('要写版本号 version');
+    if (!HEX_COLOR_PATTERN.test(skin.accent || '')) fail('主题色 accent 要写成 #rrggbb');
+    if (skin.neutral !== undefined && !HEX_COLOR_PATTERN.test(skin.neutral)) fail('底色 neutral 要写成 #rrggbb');
+    if (skin.colors !== undefined && !(Array.isArray(skin.colors) && skin.colors.length <= 8 && skin.colors.every((color) => HEX_COLOR_PATTERN.test(color)))) fail('备选颜色 colors 最多 8 个 #rrggbb');
+    if (!images(skin.art, 1, 4)) fail('art 要有 1～4 张图（webp、png 或 jpeg 的 data 地址）');
+    if (skin.wide !== undefined && !images(skin.wide, 0, 4)) fail('wide 最多 4 张图');
+    if (skin.icons !== undefined && !(typeof skin.icons === 'string' && SKIN_IMAGE_PATTERN.test(skin.icons))) fail('图标表 icons 要是一张图');
+    return { ...skin, version: skin.version.trim(), name: skin.name.trim(), note: (skin.note || '').trim() };
+}
+
+// id、名称、出处：皮肤包里的和投稿页上改过的都按这个查。
+function checkSkinLabels(skin) {
+    if (!WORKSHOP_ID_PATTERN.test(skin.id || '')) throw new WorkshopRequestError('id 只用小写字母、数字和短横线，3～32 个字符');
+    if (typeof skin.name !== 'string' || !skin.name.trim() || skin.name.length > 20) throw new WorkshopRequestError('名称 name 要 1～20 个字');
+    if (skin.note !== undefined && (typeof skin.note !== 'string' || skin.note.length > 40)) throw new WorkshopRequestError('出处 note 不能超过 40 个字');
+}
+
+function readSkinText(body) {
+    const meta = {};
+    for (const [key, limit] of Object.entries(SKIN_TEXT_LIMITS)) {
+        const value = typeof body?.[key] === 'string' ? body[key].trim() : '';
+        if ((key === 'author' && !value) || value.length > limit) throw new WorkshopRequestError(`${key} 需要 ${key === 'author' ? 1 : 0}～${limit} 个字符`);
+        meta[key] = value;
+    }
+    return meta;
+}
+
+async function listSkinPending(bucket) {
+    const listed = await bucket.list({ prefix: SKIN_PENDING_PREFIX });
+    const entries = [];
+    for (const object of listed.objects || []) {
+        if (!object.key.endsWith('.meta.json')) continue;
+        const value = (await readJsonObject(bucket, object.key)).value;
+        if (plainObject(value)) entries.push(value);
+    }
+    return entries.sort((left, right) => Number(left.submittedAt || 0) - Number(right.submittedAt || 0) || String(left.id).localeCompare(String(right.id)));
+}
+
+const skinPendingKeys = (sid) => [`${SKIN_PENDING_PREFIX}${sid}.json`, `${SKIN_PENDING_PREFIX}${sid}.meta.json`];
+
+// 公开投稿：存进待审核区，不会直接上架。投稿页上可以改 id、名称和出处（比如从站点「自定义」皮肤导出的包）；同一 id 的旧投稿由新投稿替换。
+export async function submitSkin(request, env, options = {}) {
+    const now = options.now || Date.now;
+    const bucket = env.MIRROR_BUCKET;
+    let body;
+    try {
+        body = await readJsonRequest(request, MAX_SKIN_BYTES * 2);
+    } catch (error) {
+        throw new WorkshopRequestError(error.message);
+    }
+    const source = typeof body?.source === 'string' ? body.source : '';
+    if (!source.trim() || new TextEncoder().encode(source).byteLength > MAX_SKIN_BYTES) throw new WorkshopRequestError('皮肤包不能为空，且不能超过 8MB');
+    const skin = readSkinPackage(source);
+    for (const key of ['id', 'name', 'note']) if (typeof body[key] === 'string' && body[key].trim()) skin[key] = body[key].trim();
+    checkSkinLabels(skin);
+    const meta = readSkinText(body);
+    const pending = await listSkinPending(bucket);
+    const replaced = pending.filter((entry) => entry.id === skin.id);
+    if (pending.length - replaced.length >= MAX_WORKSHOP_PENDING) throw new WorkshopRequestError('待审核的投稿已满，请稍后再试', 429);
+    const bytes = new TextEncoder().encode(JSON.stringify(skin));
+    const sid = crypto.randomUUID();
+    const entry = { sid, id: skin.id, version: skin.version, name: skin.name, note: skin.note, accent: skin.accent, ...meta, size: bytes.byteLength, sha256: await sha256Bytes(bytes), submittedAt: nowValue(now) };
+    const [packageKey, metaKey] = skinPendingKeys(sid);
+    await bucket.put(packageKey, bytes, { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+    await bucket.put(metaKey, JSON.stringify(entry), { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+    if (replaced.length) await bucket.delete(replaced.flatMap((item) => skinPendingKeys(item.sid)));
+    return { ok: true, sid, id: skin.id, version: skin.version };
+}
+
+async function readPendingSkin(bucket, sid) {
+    if (!/^[a-f0-9-]{36}$/.test(String(sid || ''))) throw new WorkshopRequestError('投稿编号无效');
+    const [packageKey, metaKey] = skinPendingKeys(sid);
+    const entry = (await readJsonObject(bucket, metaKey)).value;
+    const source = await bucket.get(packageKey);
+    if (!entry || !source) throw new WorkshopRequestError('投稿不存在或已处理', 404);
+    return { entry, bytes: new Uint8Array(await source.arrayBuffer()) };
+}
+
+async function readWorkshopSkins(bucket) {
+    try {
+        const value = (await readJsonObject(bucket, SKIN_INDEX_KEY)).value;
+        return Array.isArray(value?.skins) ? value.skins : [];
+    } catch {
+        return [];
+    }
+}
+
+// 管理员操作：上架（同 id 覆盖成新版本，第一张竖图另存一份当封面）、拒绝、下架。
+async function reviewSkins(action, request, env, options = {}) {
+    const now = options.now || Date.now;
+    const bucket = env.MIRROR_BUCKET;
+    const body = await readJsonRequest(request);
+    const state = await readJsonObject(bucket, SKIN_INDEX_KEY);
+    const skins = Array.isArray(state.value?.skins) ? state.value.skins : [];
+    const write = async (list) => {
+        const stored = await bucket.put(SKIN_INDEX_KEY, JSON.stringify({ schema: 1, updatedAt: nowValue(now), skins: list }, null, 2), manifestPutOptions(state.object));
+        if (!stored) throw new ManifestConflictError();
+    };
+    if (action === 'remove') {
+        const target = skins.find((skin) => skin.id === body?.id);
+        if (!target) throw new WorkshopRequestError('皮肤不在工坊里', 404);
+        await write(skins.filter((skin) => skin !== target));
+        await bucket.delete([target.file.path.slice(1), target.cover.path.slice(1)]);
+        return { ok: true, removed: target.id };
+    }
+    const { entry, bytes } = await readPendingSkin(bucket, body?.sid);
+    if (action === 'reject') {
+        await bucket.delete(skinPendingKeys(entry.sid));
+        return { ok: true, rejected: entry.sid };
+    }
+    if (await sha256Bytes(bytes) !== entry.sha256) throw new WorkshopRequestError('投稿文件与记录不一致，请拒绝后让作者重新投稿', 409);
+    const skin = readSkinPackage(new TextDecoder().decode(bytes));
+    const [, type, data] = /^data:image\/(webp|png|jpeg);base64,([^#]+)/.exec(skin.art[0]);
+    const cover = Uint8Array.from(atob(data), (character) => character.charCodeAt(0));
+    const file = { path: `/${SKIN_PREFIX}/${skin.id}.json`, sha256: entry.sha256, size: entry.size };
+    const coverFile = { path: `/${SKIN_PREFIX}/${skin.id}.${type === 'jpeg' ? 'jpg' : type}`, size: cover.byteLength };
+    const previous = skins.find((item) => item.id === skin.id);
+    await bucket.put(file.path.slice(1), bytes, { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+    await bucket.put(coverFile.path.slice(1), cover, { httpMetadata: { contentType: `image/${type}` } });
+    if (previous && previous.cover.path !== coverFile.path) await bucket.delete(previous.cover.path.slice(1));
+    const published = {
+        id: skin.id, name: skin.name, note: skin.note, version: skin.version, accent: skin.accent,
+        author: entry.author, description: entry.description, updatedAt: nowValue(now), cover: coverFile, file
+    };
+    await write([...skins.filter((item) => item.id !== skin.id), published].sort((left, right) => left.id.localeCompare(right.id)));
+    await bucket.delete(skinPendingKeys(entry.sid));
+    return { ok: true, published };
+}
+
+// 投稿皮肤：选好皮肤包就在浏览器里读出来、显示图和颜色，对照皮肤工坊判断新皮肤还是更新。
+const SKIN_SUBMIT_SCRIPT = String.raw`
+const byId=(id)=>document.getElementById(id);const MAX=8*1024*1024;let source='';let catalog=[];
+fetch('/workshop/skins/index.json').then((r)=>r.ok?r.json():{skins:[]}).then((v)=>{catalog=v.skins||[];if(source)inspect()}).catch(()=>{});
+function check(kind,message){const box=byId('check');box.className='notice '+kind;box.textContent=message;box.hidden=false}
+function inspect(){byId('submit').disabled=true;let skin;try{skin=JSON.parse(source)}catch{byId('detected').hidden=true;check('error','这不是皮肤包：文件不是 JSON。');return}if(!skin||skin.schema!==1||!Array.isArray(skin.art)||!skin.art.length){byId('detected').hidden=true;check('error','这不是皮肤包：缺少 schema 或图。');return}const images=[...skin.art,...(skin.wide||[])].map((url)=>{const img=document.createElement('img');img.src=url;img.alt='';return img});if(skin.icons){const img=document.createElement('img');img.src=skin.icons;img.alt='';img.className='icons';images.push(img)}byId('preview').replaceChildren(...images);byId('dots').replaceChildren(...[skin.accent,...(skin.colors||[])].filter(Boolean).map((color)=>{const dot=document.createElement('span');dot.className='dot';dot.style.background=color;dot.title=color;return dot}));if(!byId('id').value)byId('id').value=skin.id||'';if(!byId('name').value)byId('name').value=skin.name||'';if(!byId('note').value)byId('note').value=skin.note||'';byId('dVersion').textContent=skin.version||'';byId('detected').hidden=false;const current=catalog.find((item)=>item.id===byId('id').value.trim());byId('dKind').textContent=current?'更新：皮肤工坊现有 v'+current.version+'（'+current.author+'）':'新皮肤';byId('dKind').className='badge '+(current?'warn':'ok');if(current&&!byId('author').value)byId('author').value=current.author;if(current&&current.version===skin.version){check('warn','版本号和皮肤工坊里已上架的版本相同。更新皮肤请先改皮肤包里的 version。');return}check('ok','格式检查通过，填好下面的信息后提交审核。');byId('submit').disabled=false}
+const drop=byId('drop');['dragenter','dragover'].forEach((type)=>drop.addEventListener(type,(event)=>{event.preventDefault();drop.classList.add('dragging')}));['dragleave','drop'].forEach((type)=>drop.addEventListener(type,()=>drop.classList.remove('dragging')));drop.addEventListener('drop',(event)=>{event.preventDefault();if(!event.dataTransfer.files.length)return;byId('file').files=event.dataTransfer.files;byId('file').dispatchEvent(new Event('change'))});
+byId('file').addEventListener('change',async()=>{const file=byId('file').files[0];source='';byId('fileName').textContent=file?file.name:'选择皮肤包';byId('fileHint').textContent=file?Math.max(1,Math.round(file.size/1024))+' KB · 点击更换文件':'点击选择，或把 .json 文件拖到这里，不超过 8MB';drop.classList.toggle('chosen',Boolean(file));byId('detected').hidden=true;byId('submit').disabled=true;if(!file){byId('check').hidden=true;return}if(file.size>MAX){check('error','皮肤包不能超过 8MB。');return}source=await file.text();inspect()});
+byId('id').addEventListener('change',()=>{if(source)inspect()});
+byId('form').addEventListener('submit',async(event)=>{event.preventDefault();if(!source)return;byId('submit').disabled=true;check('','正在提交…');try{const response=await fetch('/api/workshop/skins/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source,id:byId('id').value,name:byId('name').value,note:byId('note').value,author:byId('author').value,description:byId('description').value,contact:byId('contact').value})});const value=await response.json().catch(()=>({}));if(!response.ok)throw new Error(value.error||('HTTP '+response.status));byId('form').hidden=true;byId('doneText').textContent=value.id+' v'+value.version+' 已进入待审核。审核通过后会出现在首页的皮肤工坊里；同一皮肤再次投稿会替换这次的投稿。';byId('done').hidden=false}catch(error){check('error','提交失败：'+error.message);byId('submit').disabled=false}});
+byId('again').addEventListener('click',()=>{location.reload()});
+`;
+
+function renderSkinSubmitHtml() {
+    const main = `<div class="submit-layout">
+<section>
+<h1>投稿皮肤</h1>
+<p class="lead">上传皮肤包后进入待审核，维护者看过图再上架到皮肤工坊。更新已有皮肤也在这里提交。</p>
+<form id="form" class="card pad form" style="margin-top:20px">
+<div class="field"><span>皮肤包</span><label id="drop" class="drop"><input id="file" class="visually-hidden" type="file" accept=".json,application/json"><span class="drop-icon" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></svg></span><span class="drop-text"><b id="fileName">选择皮肤包</b><small id="fileHint">点击选择，或把 .json 文件拖到这里，不超过 8MB</small></span></label></div>
+<div id="detected" class="detected-skin" hidden><div id="preview" class="skin-preview"></div><div class="meta"><span id="dots" class="dots"></span><span>版本 <b id="dVersion"></b></span><span id="dKind" class="badge"></span></div></div>
+<p id="check" class="notice" hidden></p>
+<label class="field">id<small>小写字母、数字和短横线，上架后不能改</small><input id="id" maxlength="32" pattern="[a-z0-9\\-]{3,32}" required></label>
+<label class="field">名称<input id="name" maxlength="20" required></label>
+<label class="field">出处<small>选填，比如角色出自哪个游戏</small><input id="note" maxlength="40"></label>
+<label class="field">作者<input id="author" maxlength="40" required></label>
+<label class="field">说明<small>选填</small><textarea id="description" maxlength="300"></textarea></label>
+<label class="field">联系方式<small>选填，方便审核时联系你</small><input id="contact" maxlength="100"></label>
+<div class="actions"><button id="submit" class="btn primary" type="submit" disabled>提交审核</button></div>
+</form>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>已提交</h2><p id="doneText" class="notes"></p><div class="actions" style="margin-top:12px"><a class="btn primary" href="/#skins">查看皮肤工坊</a><button id="again" class="btn" type="button">再投一个</button></div></div>
+</section>
+<aside class="card pad side">
+<h2>皮肤包是什么</h2>
+<ul>
+<li>一个 .json 文件，只有图和颜色，不带代码。</li>
+<li>站点装了「皮肤」插件后，在「设置 → 皮肤」里选「自定义」，放好自己的图、调好颜色，点「导出成皮肤包」就能得到。</li>
+<li>竖图给手机，横图给电脑；电脑上聊天栏在屏幕中间，横图里的人物最好靠一边。</li>
+</ul>
+<h2>审核流程</h2>
+<ol>
+<li>提交后进入待审核区。</li>
+<li>维护者看过图，决定上架或拒绝。</li>
+<li>上架后出现在首页的皮肤工坊，站点在「设置 → 皮肤」下载。</li>
+</ol>
+</aside>
+</div>`;
+    const css = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:4px 0}.field{display:grid;gap:6px;font-weight:600}.drop{display:flex;align-items:center;gap:14px;padding:16px 18px;border:1.5px dashed var(--line);border-radius:12px;background:var(--surface-2);font-weight:400;cursor:pointer;transition:border-color .15s,background .15s}.drop:hover,.drop.dragging{border-color:var(--primary);background:var(--primary-soft)}.drop.chosen{border-style:solid}.drop:focus-within{outline:2px solid color-mix(in srgb,var(--primary) 45%,transparent);outline-offset:2px}.drop-icon{display:grid;place-items:center;flex:none;width:40px;height:40px;border-radius:10px;background:var(--primary);color:#fff}.drop-text{display:grid;min-width:0}.drop-text b{overflow-wrap:anywhere}.drop-text small{color:var(--muted)}.visually-hidden{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden}' + SKIN_PREVIEW_CSS + '@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
+    return renderShell({ title: '投稿皮肤', active: '/workshop/skins/submit', main, css, script: SKIN_SUBMIT_SCRIPT });
+}
+
+const SKIN_PREVIEW_CSS = '.detected-skin{display:grid;gap:10px;padding:12px;border-radius:10px;background:var(--surface-2)}.skin-preview{display:flex;gap:8px;overflow-x:auto}.skin-preview img{flex:none;height:150px;border-radius:8px;background:var(--surface)}.skin-preview img.icons{height:100px;align-self:center}.dots{display:inline-flex;gap:4px}.dot{display:inline-block;width:16px;height:16px;border-radius:50%;box-shadow:0 0 0 1px var(--line)}';
 
 function effectiveRepo(env) {
     return typeof env?.UPSTREAM_REPO === 'string' && env.UPSTREAM_REPO.trim()
@@ -1892,6 +2099,7 @@ async function buildPublicStatus(env) {
         upstreamRepo: statusString(effectiveRepo(env), env, 300),
         testReleases: await readTestReleaseVersions(bucket),
         workshopPlugins: await readWorkshopPlugins(bucket),
+        workshopSkins: await readWorkshopSkins(bucket),
         testReleaseRepo: statusString(testReleaseRepo(env), env, 300)
     };
 }
@@ -2466,7 +2674,7 @@ function renderShell({ title, active, main, css = '', script = '' }) {
 <main class="wrap">
 ${main}
 </main>
-<footer class="wrap footer">公开数据：<code>/manifest.json</code> · <code>/test-releases/manifest.json</code> · <code>/workshop/index.json</code></footer>
+<footer class="wrap footer">公开数据：<code>/manifest.json</code> · <code>/test-releases/manifest.json</code> · <code>/workshop/index.json</code> · <code>/workshop/skins/index.json</code></footer>
 ${script ? `<script>${ASK_SCRIPT}${script}</script>` : ''}
 </body>
 </html>`;
@@ -2478,9 +2686,9 @@ const byId=(id)=>document.getElementById(id);const esc=(value)=>String(value??''
 const configured=(value)=>value?'<span class="badge ok">已配置</span>':'<span class="badge danger">未配置</span>';const notice=(message,type)=>{const box=byId('notice');box.textContent=message;box.className='notice '+(type||'')};const storedToken=()=>localStorage.getItem('mirrorAdminToken')||'';
 async function api(path,options={}){const headers=new Headers(options.headers||{});const token=storedToken();if(token)headers.set('authorization','Bearer '+token);if(options.body)headers.set('content-type','application/json');const response=await fetch(path,{...options,headers});let value;try{value=await response.json()}catch{value={ok:false,error:'响应不是有效 JSON。'}}if(!response.ok)throw new Error(value.error||('HTTP '+response.status));return value}
 function renderAuth(){const signedIn=Boolean(storedToken());byId('authForm').hidden=signedIn;byId('authState').hidden=!signedIn}
-byId('authForm').addEventListener('submit',(event)=>{event.preventDefault();const token=byId('adminToken').value.trim();if(!token)return;localStorage.setItem('mirrorAdminToken',token);byId('adminToken').value='';renderAuth();notice('管理员令牌已保存到此浏览器。','ok');refreshWorkshop()});
+byId('authForm').addEventListener('submit',(event)=>{event.preventDefault();const token=byId('adminToken').value.trim();if(!token)return;localStorage.setItem('mirrorAdminToken',token);byId('adminToken').value='';renderAuth();notice('管理员令牌已保存到此浏览器。','ok');refreshWorkshop();refreshSkins()});
 byId('logout').addEventListener('click',()=>{localStorage.removeItem('mirrorAdminToken');renderAuth();notice('已退出，令牌已从此浏览器删除。')});
-function showTab(name){if(!document.querySelector('[data-panel="'+name+'"]'))name='overview';document.querySelectorAll('[data-tab]').forEach((button)=>button.setAttribute('aria-selected',String(button.dataset.tab===name)));document.querySelector('[data-tab="'+name+'"]').scrollIntoView({block:'nearest',inline:'nearest'});document.querySelectorAll('[data-panel]').forEach((panel)=>{panel.hidden=panel.dataset.panel!==name});history.replaceState(null,'','#'+name);if(name==='tests')refreshTests();if(name==='workshop')refreshWorkshop();if(name==='feedback')refreshFeedback()}
+function showTab(name){if(!document.querySelector('[data-panel="'+name+'"]'))name='overview';document.querySelectorAll('[data-tab]').forEach((button)=>button.setAttribute('aria-selected',String(button.dataset.tab===name)));document.querySelector('[data-tab="'+name+'"]').scrollIntoView({block:'nearest',inline:'nearest'});document.querySelectorAll('[data-panel]').forEach((panel)=>{panel.hidden=panel.dataset.panel!==name});history.replaceState(null,'','#'+name);if(name==='tests')refreshTests();if(name==='workshop')refreshWorkshop();if(name==='skins')refreshSkins();if(name==='feedback')refreshFeedback()}
 document.querySelectorAll('[data-tab]').forEach((button)=>button.addEventListener('click',()=>showTab(button.dataset.tab)));window.addEventListener('hashchange',()=>showTab(location.hash.slice(1)));
 function versionItems(versions){return versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>commit <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>收录 '+esc(time(item.publishedAt))+'</span><span>'+Number(item.fileCount||0)+' 个文件</span></div></div><div class="actions"><button class="btn small show-announcement" data-tag="'+esc(item.tag)+'">公告</button><button class="btn small danger delete-version" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">删除</button></div></li>').join(''):'<li class="empty">尚无已发布版本</li>'}
 function pendingItems(pending){return pending.length?pending.map((item)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> <span class="badge warn">'+esc(item.reason)+'</span><div class="meta"><span>commit <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>发现 '+esc(time(item.seenAt))+'</span></div><div class="notes small muted">'+esc(item.detail)+'</div></div><button class="btn small retry" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">重试</button></li>').join(''):'<li class="empty">没有挂起的版本</li>'}
@@ -2508,6 +2716,12 @@ function diffLines(a,b){let start=0;while(start<a.length&&start<b.length&&a[star
 function renderDiff(oldText,newText){const ops=diffLines(oldText.split('\n'),newText.split('\n'));const keep=new Uint8Array(ops.length);let added=0,removed=0;ops.forEach((op,index)=>{if(op[0]==='+')added++;if(op[0]==='-')removed++;if(op[0]!=='=')for(let d=-3;d<=3;d++)if(index+d>=0&&index+d<ops.length)keep[index+d]=1});if(!added&&!removed)return '<div class="empty">代码和已上架版本完全相同</div>';let html='<div class="diff-sum"><span class="badge ok">+'+added+' 行</span> <span class="badge danger">-'+removed+' 行</span> <span class="muted small">只显示改动和前后 3 行</span></div>',skipped=0;const gap=()=>{if(skipped)html+='<div class="ln gap"><span></span><code>… 省略 '+skipped+' 行未改动 …</code></div>';skipped=0};ops.forEach((op,index)=>{if(!keep[index]){skipped++;return}gap();html+='<div class="ln'+(op[0]==='+'?' add':op[0]==='-'?' del':'')+'"><span>'+(op[0]==='-'?op[2]:op[3])+'</span><code>'+(op[0]==='='?' ':op[0])+' '+esc(op[1])+'</code></div>'});gap();return html}
 async function decide(action){if(!review)return;const label=action==='approve'?'上架':'拒绝';if(!await ask(action==='approve'?'确认上架？插件会拥有安装它的站点的全部权限。':'确认拒绝这条投稿？投稿文件会被删除。'))return;try{const result=await api('/api/workshop/'+action,{method:'POST',body:JSON.stringify({sid:review.item.sid})});byId('reviewPanel').hidden=true;review=null;await refreshWorkshop();notice(action==='approve'?'已上架 '+result.published.id+' v'+result.published.version+'。':'已'+label+'。','ok')}catch(error){notice(label+'失败：'+error.message,'error')}}
 byId('reviewApprove').addEventListener('click',()=>decide('approve'));byId('reviewReject').addEventListener('click',()=>decide('reject'));byId('reviewClose').addEventListener('click',()=>{byId('reviewPanel').hidden=true});byId('workshopRefresh').addEventListener('click',async()=>{await refreshWorkshop();notice('工坊已刷新。','ok')});
+let skinState={pending:[],skins:[]};let skinReview=null;
+async function refreshSkins(){if(!storedToken()){byId('skinPendingBody').innerHTML='<li class="empty">保存管理员令牌后才能查看投稿</li>';byId('skinListBody').innerHTML='';return}try{skinState=await api('/api/workshop/skins/pending');renderSkins()}catch(error){notice(error.message,'error')}}
+function renderSkins(){byId('skinCount').textContent=skinState.pending.length?String(skinState.pending.length):'';byId('skinPendingBody').innerHTML=skinState.pending.length?skinState.pending.map((item)=>{const current=skinState.skins.find((skin)=>skin.id===item.id);return '<li><div class="grow"><b>'+esc(item.name)+'</b> <code>'+esc(item.id)+'</code> '+(current?'<span class="badge warn">更新 '+esc(current.version)+' → '+esc(item.version)+'</span>':'<span class="badge ok">新皮肤 '+esc(item.version)+'</span>')+'<div class="meta">'+(item.note?'<span>'+esc(item.note)+'</span>':'')+'<span>'+esc(item.author)+'</span><span>投稿 '+esc(time(item.submittedAt))+'</span><span>'+kb(item.size)+'</span>'+(item.contact?'<span>联系 '+esc(item.contact)+'</span>':'')+'</div>'+(item.description?'<p class="notes small">'+esc(item.description)+'</p>':'')+'</div><button class="btn small primary skin-review" data-sid="'+esc(item.sid)+'">看图</button></li>'}).join(''):'<li class="empty">没有待审核的皮肤</li>';byId('skinListBody').innerHTML=skinState.skins.length?skinState.skins.map((skin)=>'<li><img class="skin-cover" src="'+esc(skin.cover.path)+'" alt=""><div class="grow"><b>'+esc(skin.name)+'</b> <code>'+esc(skin.id)+'</code> <span class="badge">v'+esc(skin.version)+'</span><div class="meta">'+(skin.note?'<span>'+esc(skin.note)+'</span>':'')+'<span>'+esc(skin.author)+'</span><span>更新 '+esc(time(skin.updatedAt))+'</span><span>'+kb(skin.file&&skin.file.size)+'</span></div></div><button class="btn small danger skin-remove" data-id="'+esc(skin.id)+'">下架</button></li>').join(''):'<li class="empty">皮肤工坊里还没有皮肤</li>';document.querySelectorAll('.skin-review').forEach((button)=>button.addEventListener('click',()=>openSkinReview(button.dataset.sid).catch((error)=>notice(error.message,'error'))));document.querySelectorAll('.skin-remove').forEach((button)=>button.addEventListener('click',async()=>{if(!await ask('确认下架 '+button.dataset.id+'？已经下载了的站点不受影响，但皮肤工坊里不再显示。'))return;button.disabled=true;try{await api('/api/workshop/skins/remove',{method:'POST',body:JSON.stringify({id:button.dataset.id})});notice('已下架 '+button.dataset.id+'。','ok');await refreshSkins()}catch(error){notice(error.message,'error');button.disabled=false}}))}
+async function openSkinReview(sid){const item=skinState.pending.find((entry)=>entry.sid===sid);if(!item)return;notice('正在读取皮肤包…');const response=await fetch('/api/workshop/skins/pending/'+sid+'.json',{headers:{authorization:'Bearer '+storedToken()}});if(!response.ok)throw new Error('读取皮肤包失败：HTTP '+response.status);const skin=await response.json();skinReview=item;byId('skinReviewTitle').textContent=item.name+' · '+item.id+' v'+item.version;byId('skinReviewMeta').innerHTML=(item.note?'<span>'+esc(item.note)+'</span>':'')+'<span>作者 '+esc(item.author)+'</span><span>'+kb(item.size)+'</span>'+[skin.accent].concat(skin.colors||[]).map((color)=>'<span class="dot" style="background:'+esc(color)+'" title="'+esc(color)+'"></span>').join('');byId('skinReviewDescription').textContent=item.description||'';const images=[...skin.art,...(skin.wide||[])].map((url)=>{const img=document.createElement('img');img.src=url;img.alt='';return img});if(skin.icons){const img=document.createElement('img');img.src=skin.icons;img.alt='';img.className='icons';images.push(img)}byId('skinReviewImages').replaceChildren(...images);byId('skinReviewPanel').hidden=false;byId('skinReviewPanel').scrollIntoView({block:'start'});notice('看过图再决定上架或拒绝。')}
+async function decideSkin(action){if(!skinReview)return;const label=action==='approve'?'上架':'拒绝';if(!await ask(action==='approve'?'确认上架这套皮肤？':'确认拒绝这条投稿？皮肤包会被删除。'))return;try{const result=await api('/api/workshop/skins/'+action,{method:'POST',body:JSON.stringify({sid:skinReview.sid})});byId('skinReviewPanel').hidden=true;skinReview=null;await refreshSkins();notice(action==='approve'?'已上架 '+result.published.id+' v'+result.published.version+'。':'已'+label+'。','ok')}catch(error){notice(label+'失败：'+error.message,'error')}}
+byId('skinApprove').addEventListener('click',()=>decideSkin('approve'));byId('skinReject').addEventListener('click',()=>decideSkin('reject'));byId('skinReviewClose').addEventListener('click',()=>{byId('skinReviewPanel').hidden=true});byId('skinRefresh').addEventListener('click',async()=>{await refreshSkins();notice('皮肤工坊已刷新。','ok')});
 let feedbackCursor = '', feedbackSelected = null;
 const issueNames = { image: '图片不对', save: '保存失败', sync: '同步异常', voice: '朗读异常', startup: '打不开或卡住', other: '其他问题' };
 const clock = value => new Date(Number(value)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
@@ -2590,7 +2804,7 @@ byId('feedbackDownload').onclick = () => {
 };
 byId('logout').addEventListener('click', clearFeedback);
 byId('authForm').addEventListener('submit', () => { if (location.hash === '#feedback') refreshFeedback(); });
-renderAuth();refresh();showTab(location.hash.slice(1)||'overview');if(storedToken())refreshWorkshop();
+renderAuth();refresh();showTab(location.hash.slice(1)||'overview');if(storedToken()){refreshWorkshop();refreshSkins()}
 `;
 
 const ADMIN_CSS = '.admin-head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px 20px;margin-bottom:16px}.auth{display:flex;gap:8px;align-items:center}.auth input{width:240px}.tabs{display:flex;gap:4px;margin:18px 0 16px;border-bottom:1px solid var(--line);overflow-x:auto}.tabs button{position:relative;padding:9px 14px;border:0;border-bottom:2px solid transparent;background:none;color:var(--muted);font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}.tabs button[aria-selected=true]{color:var(--primary-text);border-bottom-color:var(--primary)}.tabs .count:not(:empty){margin-left:6px;padding:0 7px;border-radius:999px;background:var(--danger);color:#fff;font-size:12px}.panel-grid{display:grid;gap:16px}.panel-grid h2{margin-bottom:10px}.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.kv{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--line)}.kv:first-of-type{border-top:0}.inline-form{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.inline-form input[type=number]{width:90px}#announcementPanel h3{margin-bottom:8px}#announcementPanel pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.review-head{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px}.code-tabs{display:flex;gap:6px;margin:12px 0 8px}.code-tabs button[aria-selected=true]{border-color:var(--primary);color:var(--primary-text)}.code{max-height:560px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--surface-2)}.ln{display:grid;grid-template-columns:52px minmax(0,1fr);font:12.5px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}.ln span{padding:0 8px;text-align:right;color:var(--muted);user-select:none;border-right:1px solid var(--line)}.ln code{padding:0 10px;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.ln.add{background:var(--ok-soft)}.ln.del{background:var(--danger-soft)}.ln.gap code{color:var(--muted);font-style:italic}.diff-sum{display:flex;gap:6px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line)}@media(max-width:640px){.auth{width:100%}.auth input{flex:1;width:auto}}';
@@ -2606,6 +2820,7 @@ function renderConsoleHtml() {
 <button type="button" role="tab" data-tab="upstream">上游版本<span id="pendingCount" class="count"></span></button>
 <button type="button" role="tab" data-tab="tests">测试版</button>
 <button type="button" role="tab" data-tab="workshop">插件审核<span id="workshopCount" class="count"></span></button>
+<button type="button" role="tab" data-tab="skins">皮肤审核<span id="skinCount" class="count"></span></button>
 <button type="button" role="tab" data-tab="feedback">使用与反馈</button>
 <button type="button" role="tab" data-tab="settings">设置</button>
 </div>
@@ -2641,6 +2856,17 @@ function renderConsoleHtml() {
 </div>
 <div><h2>已上架插件</h2><ul id="workshopPluginsBody" class="list card"></ul></div>
 </section>
+<section data-panel="skins" class="panel-grid" hidden>
+<div class="block-head" style="margin:0"><div><h2>待审核皮肤</h2><p class="muted small">投稿页：<a href="/workshop/skins/submit">/workshop/skins/submit</a>。同一 id 上架会覆盖旧版本。</p></div><button id="skinRefresh" class="btn" type="button">刷新</button></div>
+<ul id="skinPendingBody" class="list card"></ul>
+<div id="skinReviewPanel" class="card pad" hidden>
+<div class="review-head"><div><h2 id="skinReviewTitle"></h2><div id="skinReviewMeta" class="meta"></div></div><button id="skinReviewClose" class="btn small" type="button">关闭</button></div>
+<p id="skinReviewDescription" class="notes"></p>
+<div id="skinReviewImages" class="skin-preview"></div>
+<div class="actions" style="margin-top:12px"><button id="skinApprove" class="btn primary" type="button">上架</button><button id="skinReject" class="btn danger" type="button">拒绝</button></div>
+</div>
+<div><h2>已上架皮肤</h2><ul id="skinListBody" class="list card"></ul></div>
+</section>
 <section data-panel="feedback" class="panel-grid" hidden>
 <div class="block-head" style="margin:0"><div><h2>活跃 Cloudflare 账户</h2><p id="feedbackHint" class="muted small">保存管理员令牌后可查看。</p></div><button id="feedbackRefresh" class="btn" type="button">刷新</button></div>
 <div id="feedbackStats" class="metrics">
@@ -2667,7 +2893,7 @@ function renderConsoleHtml() {
 <div class="card pad"><h2>运行配置</h2><form id="configForm" class="inline-form" style="margin-top:10px"><label for="releaseLimit">保留上游 Release 数</label><input id="releaseLimit" type="number" min="1" max="12" step="1"><label><input id="webhookEnabled" type="checkbox"> 启用 Webhook 通知</label><button class="btn primary" type="submit">保存</button></form><div class="actions" style="margin-top:12px"><button id="webhookTest" class="btn" type="button">测试 Webhook</button></div></div>
 <div class="card pad"><h2>环境</h2><div class="kv"><span>GitHub 令牌</span><span id="secretGithub"></span></div><div class="kv"><span>Webhook 地址</span><span id="secretWebhook"></span></div><div class="kv"><span>Webhook 鉴权</span><span id="secretWebhookAuth"></span></div><div class="kv"><span>管理员令牌</span><span id="secretAdmin"></span></div><div class="kv"><span>上游仓库</span><span id="upstreamRepo"></span></div><div class="kv"><span>补丁修订</span><code id="patchRevision"></code></div></div>
 </section>`;
-    return renderShell({ title: '管理', active: '/admin', main, css: ADMIN_CSS, script: ADMIN_SCRIPT });
+    return renderShell({ title: '管理', active: '/admin', main, css: ADMIN_CSS + SKIN_PREVIEW_CSS + '.skin-cover{width:42px;height:56px;border-radius:6px;object-fit:cover;object-position:center 18%}', script: ADMIN_SCRIPT });
 }
 
 function publicPendingReason(reason) {
@@ -2713,6 +2939,7 @@ function renderPublicHtml(status, announcement = '') {
     const versions = status.manifest.versions;
     const testReleases = status.testReleases || [];
     const plugins = status.workshopPlugins || [];
+    const skins = status.workshopSkins || [];
     const latestTest = testReleases[0];
 
     const versionItem = (version, index) => `<li>
@@ -2750,6 +2977,14 @@ function renderPublicHtml(status, announcement = '') {
         <div class="meta"><span>更新于 ${escapeHtml(formatShortTime(plugin.updatedAt))}</span><a href="${escapeHtml(plugin.file.path)}">查看源码</a></div>
     </article>`).join('')}</div>`
         : '<div class="card empty">工坊里还没有插件。<a href="/workshop/submit">投稿第一个插件</a></div>';
+    const skinCards = skins.length
+        ? `<div class="skins">${skins.map((skin) => `<article class="card skin">
+        <img src="${escapeHtml(skin.cover.path)}" alt="" loading="lazy">
+        <div class="skin-body"><div class="plugin-head"><h3>${escapeHtml(skin.name)}</h3><span class="badge">v${escapeHtml(skin.version)}</span></div>
+        <div class="meta">${skin.note ? `<span>${escapeHtml(skin.note)}</span>` : ''}<span>${escapeHtml(skin.author)}</span><span>${formatKilobytes(skin.file.size)}</span></div>
+        ${skin.description ? `<p>${escapeHtml(skin.description)}</p>` : ''}</div>
+    </article>`).join('')}</div>`
+        : '<div class="card empty">皮肤工坊里还没有皮肤。<a href="/workshop/skins/submit">投稿第一套皮肤</a></div>';
 
     const main = `<section class="hero">
 <h1>RP-Hub 分发站</h1>
@@ -2758,6 +2993,7 @@ function renderPublicHtml(status, announcement = '') {
 <a class="stat" href="#upstream"><span>上游最新版本</span><b>${escapeHtml(versions[0]?.tag || '—')}</b></a>
 <a class="stat" href="#test-builds"><span>测试版最新版本</span><b>${escapeHtml(latestTest?.tag || '—')}</b></a>
 <a class="stat" href="#workshop"><span>工坊插件</span><b>${plugins.length} 个</b></a>
+<a class="stat" href="#skins"><span>工坊皮肤</span><b>${skins.length} 套</b></a>
 </div>
 </section>
 ${announcement}
@@ -2774,8 +3010,13 @@ ${tests}
 <section id="workshop" class="block" aria-labelledby="workshop-title">
 <div class="block-head"><div><h2 id="workshop-title">插件工坊</h2><p class="muted small">经审核上架，测试版站点在「模块管理 → 工坊」一键安装和更新。插件拥有页面全部权限，请只安装信任的插件。</p></div><a class="btn primary" href="/workshop/submit">投稿插件</a></div>
 ${pluginCards}
+</section>
+<section id="skins" class="block" aria-labelledby="skins-title">
+<div class="block-head"><div><h2 id="skins-title">皮肤工坊</h2><p class="muted small">经审核上架，只有图和配色、不带代码。测试版站点装上「皮肤」插件后，在「设置 → 皮肤」里下载。</p></div><a class="btn primary" href="/workshop/skins/submit">投稿皮肤</a></div>
+${skinCards}
 </section>`;
-    return renderShell({ title: '首页', active: '/', main });
+    const css = '.skins{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}.skin{padding:0;overflow:hidden}.skin img{display:block;width:100%;aspect-ratio:3/4;object-fit:cover;object-position:center 18%;background:var(--surface-2)}.skin-body{padding:10px 12px 12px}.skin-body h3{font-size:16px}.skin-body p{margin:6px 0 0;color:var(--muted);font-size:13px}';
+    return renderShell({ title: '首页', active: '/', main, css });
 }
 
 function snapshotObjectKey(pathname) {
@@ -3117,7 +3358,7 @@ async function handleRequest(request, env, options = {}) {
             return jsonResponse({ ok: false, error: safeErrorMessage(error, env) }, { status: 500 });
         }
     }
-    if (request.method === 'GET' && url.pathname.startsWith(`/${WORKSHOP_PREFIX}/`) && url.pathname !== '/workshop/submit') {
+    if (request.method === 'GET' && url.pathname.startsWith(`/${WORKSHOP_PREFIX}/`) && !['/workshop/submit', '/workshop/skins/submit'].includes(url.pathname)) {
         try {
             return await serveWorkshop(url.pathname, env);
         } catch (error) {
@@ -3137,7 +3378,7 @@ async function handleRequest(request, env, options = {}) {
             return new Response(renderPublicHtml(status, await publicAnnouncement(env, url)), {
                 headers: {
                     'cache-control': 'no-store',
-                    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
                     'content-type': 'text/html; charset=utf-8',
                     'referrer-policy': 'no-referrer',
                     'x-content-type-options': 'nosniff',
@@ -3154,7 +3395,7 @@ async function handleRequest(request, env, options = {}) {
             return new Response(renderConsoleHtml(status), {
                 headers: {
                     'cache-control': 'no-store',
-                    'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                    'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
                     'content-type': 'text/html; charset=utf-8',
                     'referrer-policy': 'no-referrer',
                     'x-content-type-options': 'nosniff',
@@ -3191,6 +3432,44 @@ async function handleRequest(request, env, options = {}) {
                 'x-frame-options': 'DENY'
             }
         });
+    }
+    if (request.method === 'GET' && url.pathname === '/workshop/skins/submit') {
+        return new Response(renderSkinSubmitHtml(), {
+            headers: {
+                'cache-control': 'no-store',
+                'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                'content-type': 'text/html; charset=utf-8',
+                'referrer-policy': 'no-referrer',
+                'x-content-type-options': 'nosniff',
+                'x-frame-options': 'DENY'
+            }
+        });
+    }
+    if (request.method === 'POST' && url.pathname === '/api/workshop/skins/submit') {
+        try {
+            return jsonResponse(await submitSkin(request, env, runtimeOptions));
+        } catch (error) {
+            return jsonResponse({ ok: false, error: error instanceof WorkshopRequestError ? error.message : safeErrorMessage(error, env) }, { status: error.status || 500 });
+        }
+    }
+    const skinAdminRoute = (request.method === 'GET' && (url.pathname === '/api/workshop/skins/pending' || SKIN_PENDING_SOURCE_PATTERN.test(url.pathname)))
+        || (request.method === 'POST' && ['/api/workshop/skins/approve', '/api/workshop/skins/reject', '/api/workshop/skins/remove'].includes(url.pathname));
+    if (skinAdminRoute) {
+        const forbidden = await authorizeWrite(request, env);
+        if (forbidden) return forbidden;
+        try {
+            if (url.pathname === '/api/workshop/skins/pending') {
+                return jsonResponse({ ok: true, pending: await listSkinPending(env.MIRROR_BUCKET), skins: await readWorkshopSkins(env.MIRROR_BUCKET) });
+            }
+            const sourceMatch = url.pathname.match(SKIN_PENDING_SOURCE_PATTERN);
+            if (sourceMatch) {
+                const { bytes } = await readPendingSkin(env.MIRROR_BUCKET, sourceMatch[1]);
+                return new Response(bytes, { headers: { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8', 'x-content-type-options': 'nosniff' } });
+            }
+            return jsonResponse(await reviewSkins(url.pathname.split('/').pop(), request, env, runtimeOptions));
+        } catch (error) {
+            return jsonResponse({ ok: false, error: error instanceof WorkshopRequestError ? error.message : safeErrorMessage(error, env) }, { status: error.status || 400 });
+        }
     }
     if (request.method === 'POST' && url.pathname === '/api/workshop/submit') {
         try {
