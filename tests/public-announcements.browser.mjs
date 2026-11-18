@@ -46,9 +46,9 @@ try {
     const page = await browser.newPage();
     await bucket.delete('_mirror/announcements.json');
     await page.goto(base + '/?tag=1.9.6#announcement');
-    assert.match(await page.locator('#announcement').textContent(), /公告暂时无法读取/);
+    assert.match(await page.locator('#announcement').textContent(), /公告加载失败/);
     await page.getByRole('button', { name: '重试', exact: true }).click();
-    assert.match(await page.locator('#announcement').textContent(), /公告暂时无法读取/);
+    assert.match(await page.locator('#announcement').textContent(), /公告加载失败/);
     const restored = fixture().bucket.records.get('_mirror/announcements.json');
     bucket.seedText('_mirror/announcements.json', new TextDecoder().decode(restored.bytes));
     await page.getByRole('button', { name: '重试', exact: true }).click();

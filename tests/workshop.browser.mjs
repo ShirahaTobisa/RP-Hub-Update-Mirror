@@ -64,10 +64,10 @@ try {
     console.log('PASS admin reviews the full source and publishes the submission');
 
     await submit(pluginSource('1.0.0'));
-    assert.match(await page.textContent('#check'), /版本号和工坊里已上架的版本相同/);
+    assert.match(await page.textContent('#check'), /版本号与已上架版本相同/);
     assert.equal(await page.isDisabled('#submit'), true);
     await submit(pluginSource('1.1.0', "\n        ctx.ui.toast('新功能');"));
-    assert.match(await page.textContent('#dKind'), /更新：工坊现有 v1\.0\.0（测试作者）/);
+    assert.match(await page.textContent('#dKind'), /更新：已上架 v1\.0\.0（测试作者）/);
     assert.equal(await page.inputValue('#author'), '测试作者', 'an update keeps the published author');
     await page.click('#submit');
     await page.locator('#done').waitFor();
@@ -83,7 +83,7 @@ try {
 
     await page.locator('.ws-remove').click();
     await confirmAsk();
-    await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('工坊里还没有插件'));
+    await page.waitForFunction(() => document.querySelector('#workshopPluginsBody').textContent.includes('暂无插件'));
     assert.deepEqual(errors, []);
     console.log('PASS admin page removes a published plugin');
 } finally {

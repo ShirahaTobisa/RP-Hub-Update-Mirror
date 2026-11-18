@@ -29,9 +29,9 @@ for (const corrupt of [null, 'not-json']) {
     const response = await get('/?tag=1.9.6');
     assert.equal(response.status, 200);
     const body = await response.text();
-    assert.match(body, /公告暂时无法读取/);
+    assert.match(body, /公告加载失败/);
     assert.match(body, /重试/);
-    assert.match(body, /上游版本/);
+    assert.match(body, /官方版本/);
     assert.doesNotMatch(body, /请先在管理端/);
 }
 for (const [method, route] of [

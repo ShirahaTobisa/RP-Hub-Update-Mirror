@@ -27,7 +27,7 @@ let response = await submit('alpha');
 assert.equal(response.status, 200, await response.clone().text());
 assert.equal((await response.json()).id, 'alpha');
 assert.equal((await call('/workshop/index.json')).status, 404, 'a submission must not be published before review');
-for (const [extra, pattern] of [[{ name: '' }, /name/], [{ description: 'x'.repeat(301) }, /description/], [{ source: 'nothing here' }, /RPHubSDK\.register/]]) {
+for (const [extra, pattern] of [[{ name: '' }, /名称/], [{ description: 'x'.repeat(301) }, /说明/], [{ source: 'nothing here' }, /RPHubSDK\.register/]]) {
     response = await call('/api/workshop/submit', { method: 'POST', body: { source: source('beta'), name: 'n', author: 'a', description: 'd', ...extra } });
     assert.equal(response.status, 400);
     assert.match((await response.json()).error, pattern);

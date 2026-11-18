@@ -23,7 +23,7 @@ const pending = async () => (await (await call('/api/workshop/skins/pending', { 
 
 assert.equal(readSkinPackage(JSON.stringify(skin('lily'))).name, '皮肤 lily');
 for (const [bad, pattern] of [
-    [{ css: 'body{display:none}' }, /只能有图片和配色/], [{ apply: 'x' }, /只能有图片和配色/], [{ schema: 2 }, /schema/],
+    [{ css: 'body{display:none}' }, /只能包含图片和配色/], [{ apply: 'x' }, /只能包含图片和配色/], [{ schema: 2 }, /schema/],
     [{ id: 'Lily!' }, /id/], [{ accent: 'red' }, /accent/], [{ art: [] }, /art/], [{ art: ['https://example.com/a.webp'] }, /art/],
     [{ art: [image().replace('webp', 'svg+xml')] }, /art/], [{ wide: [image('#top')] }, /wide/], [{ colors: ['#123456', 'blue'] }, /colors/]
 ]) assert.throws(() => readSkinPackage(JSON.stringify(skin('lily', '1.0.0', bad))), pattern);
@@ -34,7 +34,7 @@ let response = await submit(skin('lily'));
 assert.equal(response.status, 200, await response.clone().text());
 assert.equal((await response.json()).id, 'lily');
 assert.equal((await call('/workshop/skins/index.json')).status, 404, 'a submission must not be published before review');
-for (const [value, extra, pattern] of [[skin('lily'), { author: '' }, /author/], [skin('lily', '1.0.0', { css: 'x' }), {}, /只能有图片和配色/]]) {
+for (const [value, extra, pattern] of [[skin('lily'), { author: '' }, /作者/], [skin('lily', '1.0.0', { css: 'x' }), {}, /只能包含图片和配色/]]) {
     response = await submit(value, extra);
     assert.equal(response.status, 400);
     assert.match((await response.json()).error, pattern);

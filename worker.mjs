@@ -57,7 +57,7 @@ class ReleaseIncompleteError extends Error {
 
 class ManifestConflictError extends Error {
     constructor() {
-        super('镜像 manifest 被另一轮同步更新，本轮未提交。');
+        super('数据已被其他操作更新，请重试。');
         this.name = 'ManifestConflictError';
     }
 }
@@ -148,7 +148,7 @@ async function fetchWithTimeout(fetchImpl, url, options = {}) {
 
 function githubHeaders(env, accept = 'application/vnd.github+json') {
     const token = typeof env?.GITHUB_TOKEN === 'string' ? env.GITHUB_TOKEN.trim() : '';
-    if (!token) throw new Error('缺少 GITHUB_TOKEN secret。');
+    if (!token) throw new Error('未配置 GITHUB_TOKEN。');
     return {
         accept,
         authorization: `Bearer ${token}`,
@@ -183,7 +183,7 @@ async function fetchRawFile(fetchImpl, env, repo, commit, path) {
     });
     if (!response.ok) {
         await response.body?.cancel().catch(() => {});
-        throw new Error(`下载上游文件失败：${path}；HTTP ${response.status}`);
+        throw new Error(`下载官方文件失败：${path}（HTTP ${response.status}）`);
     }
     return new Uint8Array(await response.arrayBuffer());
 }
@@ -301,7 +301,7 @@ async function fetchReleases(fetchImpl, env, repo, releaseLimit) {
         env,
         `https://api.github.com/repos/${repo}/releases?per_page=${releaseLimit}`
     );
-    if (!Array.isArray(releases)) throw new Error('GitHub Releases 列表格式异常。');
+    if (!Array.isArray(releases)) throw new Error('GitHub 版本列表格式异常。');
     return releases
         .filter((release) => !release?.draft)
         .map((release) => ({
@@ -320,13 +320,13 @@ async function resolveReleaseCommit(fetchImpl, env, repo, tag) {
         `https://api.github.com/repos/${repo}/commits/${encodeURIComponent(tag)}`
     );
     const sha = typeof commit?.sha === 'string' ? commit.sha.toLowerCase() : '';
-    if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error(`GitHub 未能解析 Release tag：${tag}`);
+    if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error(`GitHub 未找到版本 ${tag} 对应的提交。`);
     return sha;
 }
 
 function selectTreeFiles(tree, tag) {
     if (!tree || !Array.isArray(tree.tree) || tree.truncated) {
-        throw new ReleaseIncompleteError(`Release ${tag} 的递归文件树不完整。`);
+        throw new ReleaseIncompleteError(`版本 ${tag} 的文件列表不完整。`);
     }
     const files = [];
     for (const entry of tree.tree) {
@@ -334,16 +334,16 @@ function selectTreeFiles(tree, tag) {
         if (entry?.type !== 'blob' || !isAllowedAppUpdatePath(path)) continue;
         const size = Number(entry.size || 0);
         if (!Number.isSafeInteger(size) || size < 0 || size > MAX_APP_UPDATE_FILE_BYTES) {
-            throw new ReleaseIncompleteError(`上游文件过大，已停止更新：${path}`);
+            throw new ReleaseIncompleteError(`官方文件过大，已停止更新：${path}`);
         }
         files.push(path);
         if (files.length > MAX_APP_UPDATE_FILES) {
-            throw new ReleaseIncompleteError(`上游文件数量超过限制（${MAX_APP_UPDATE_FILES}），已停止更新。`);
+            throw new ReleaseIncompleteError(`官方文件数量超过限制（${MAX_APP_UPDATE_FILES} 个），已停止更新。`);
         }
     }
     files.sort((left, right) => left.localeCompare(right));
     for (const required of REQUIRED_UPSTREAM_FILES) {
-        if (!files.includes(required)) throw new ReleaseIncompleteError(`上游 Release 缺少必要文件：${required}`);
+        if (!files.includes(required)) throw new ReleaseIncompleteError(`官方版本缺少必要文件：${required}`);
     }
     return files;
 }
@@ -567,7 +567,7 @@ function parseArtifactTar(tarBytes) {
             pendingLongName = '';
             const path = normalizeArtifactPath(rawPath);
             if (isAllowedAppUpdatePath(path) && size > MAX_APP_UPDATE_FILE_BYTES) {
-                throw new ReleaseIncompleteError(`上游文件过大，已停止更新：${path}`);
+                throw new ReleaseIncompleteError(`官方文件过大，已停止更新：${path}`);
             }
             if (files.has(path)) throw new ArtifactParseError(`TAR 存在重复文件：${path}`);
             files.set(path, data);
@@ -623,11 +623,11 @@ async function downloadArtifact(fetchImpl, env, artifact) {
     });
     if ([401, 403, 410].includes(response.status)) {
         await response.body?.cancel().catch(() => {});
-        throw new ArtifactUnavailableError(`github-pages artifact 下载不可用：HTTP ${response.status}`, response.status);
+        throw new ArtifactUnavailableError(`预览版压缩包下载失败：HTTP ${response.status}`, response.status);
     }
     if (!response.ok) {
         const text = await response.text();
-        throw new Error(`github-pages artifact 下载失败：HTTP ${response.status} ${text.slice(0, 200)}`);
+        throw new Error(`预览版压缩包下载失败：HTTP ${response.status} ${text.slice(0, 200)}`);
     }
     const bytes = new Uint8Array(await response.arrayBuffer());
     const expected = String(artifact?.digest || '').toLowerCase().replace(/^sha256:/, '');
@@ -692,20 +692,20 @@ function validateArtifactFiles(files) {
         if (!isAllowedAppUpdatePath(path)) continue;
         if (!(bytes instanceof Uint8Array)) throw new ArtifactParseError(`artifact 文件字节无效：${path}`);
         if (bytes.byteLength > MAX_APP_UPDATE_FILE_BYTES) {
-            throw new ReleaseIncompleteError(`上游文件过大，已停止更新：${path}`);
+            throw new ReleaseIncompleteError(`官方文件过大，已停止更新：${path}`);
         }
         totalBytes += bytes.byteLength;
         if (totalBytes > MAX_APP_UPDATE_TOTAL_BYTES) {
-            throw new ReleaseIncompleteError('上游文件总大小超过限制（160MiB），已停止更新。');
+            throw new ReleaseIncompleteError('官方文件总大小超过限制（160MB），已停止更新。');
         }
         paths.push(path);
         if (paths.length > MAX_APP_UPDATE_FILES) {
-            throw new ReleaseIncompleteError(`上游文件数量超过限制（${MAX_APP_UPDATE_FILES}），已停止更新。`);
+            throw new ReleaseIncompleteError(`官方文件数量超过限制（${MAX_APP_UPDATE_FILES} 个），已停止更新。`);
         }
     }
     paths.sort((left, right) => left.localeCompare(right));
     for (const required of REQUIRED_UPSTREAM_FILES) {
-        if (!paths.includes(required)) throw new ReleaseIncompleteError(`上游 Release 缺少必要文件：${required}`);
+        if (!paths.includes(required)) throw new ReleaseIncompleteError(`官方版本缺少必要文件：${required}`);
     }
     return paths;
 }
@@ -740,10 +740,10 @@ async function buildVersionSnapshotFromFiles(bucket, release, commit, files, ann
         patchRpHubAppJs(new TextDecoder().decode(appJsBytes), { version: release.tag }).code
     );
     if (patchedAppJs.byteLength > MAX_APP_UPDATE_FILE_BYTES) {
-        throw new ReleaseIncompleteError('上游文件过大，已停止更新：assets/js/app.js');
+        throw new ReleaseIncompleteError('官方文件过大，已停止更新：assets/js/app.js');
     }
     if (nonAppTotalBytes + patchedAppJs.byteLength > MAX_APP_UPDATE_TOTAL_BYTES) {
-        throw new ReleaseIncompleteError('上游文件总大小超过限制（160MiB），已停止更新。');
+        throw new ReleaseIncompleteError('官方文件总大小超过限制（160MB），已停止更新。');
     }
     // 2.0.4 起的云端备份脚本也要能打上补丁，否则站点更新时会被拒。
     const cloudBackupBytes = files.get(RP_HUB_CLOUD_BACKUP_PATH);
@@ -790,7 +790,7 @@ function validateStoredManifest(value, repo) {
         || !Array.isArray(value.versions)
         || !Array.isArray(value.pending)
     ) {
-        throw new Error('现有镜像 manifest 格式无效，已拒绝覆盖。');
+        throw new Error('版本列表格式无效，已停止同步。');
     }
     return structuredClone(value);
 }
@@ -1031,7 +1031,7 @@ export async function syncMirror(env, options = {}) {
     const fetchImpl = options.fetchImpl || fetch;
     const now = options.now || Date.now;
     const bucket = env?.MIRROR_BUCKET;
-    if (!bucket) throw new Error('缺少 MIRROR_BUCKET R2 binding。');
+    if (!bucket) throw new Error('未绑定 R2 存储桶 MIRROR_BUCKET。');
     const repo = typeof env.UPSTREAM_REPO === 'string' && env.UPSTREAM_REPO.trim()
         ? env.UPSTREAM_REPO.trim()
         : DEFAULT_UPSTREAM_REPO;
@@ -1041,7 +1041,7 @@ export async function syncMirror(env, options = {}) {
     const reportProgress = createSyncProgressReporter(bucket, env, now);
     const announcementSources = new Map();
     try {
-        await reportProgress('running', '开始同步', '读取 manifest 与上游 Release 列表');
+        await reportProgress('running', '开始同步', '获取官方版本列表');
         const manifestState = await readJsonObject(bucket, MANIFEST_KEY);
         const manifest = validateStoredManifest(manifestState.value, repo);
         const releases = await fetchReleases(fetchImpl, env, repo, releaseLimit);
@@ -1072,7 +1072,7 @@ export async function syncMirror(env, options = {}) {
             const retag = Boolean(existing && existing.commit !== context.commit);
             try {
                 snapshotsBuilt += 1;
-                await reportProgress('running', `构建快照 ${release.tag}`, `逐文件拉取 commit ${context.commit.slice(0, 12)}`);
+                await reportProgress('running', `收录 ${release.tag}`, `下载文件（提交 ${context.commit.slice(0, 12)}）`);
                 const version = await buildVersionSnapshot(
                     fetchImpl,
                     env,
@@ -1119,7 +1119,7 @@ export async function syncMirror(env, options = {}) {
 
         let latestArtifact = null;
         try {
-            await reportProgress('running', '检查 artifact', '拉取 github-pages artifact 列表');
+            await reportProgress('running', '检查预览版', '获取最新预览版');
             latestArtifact = await fetchLatestArtifact(fetchImpl, env, repo);
         } catch (error) {
             console.error(JSON.stringify({
@@ -1176,11 +1176,11 @@ export async function syncMirror(env, options = {}) {
                                 : ''
                         };
                         let version;
-                        let detail = 'artifact direct intake';
+                        let detail = '预览版';
                         try {
                             let files;
                             try {
-                                await reportProgress('running', `下载 artifact ${artifactTag}`, `commit ${artifactCommit.slice(0, 12)}`);
+                                await reportProgress('running', `下载预览版 ${artifactTag}`, `提交 ${artifactCommit.slice(0, 12)}`);
                                 const zipBytes = await downloadArtifact(fetchImpl, env, latestArtifact.artifact);
                                 files = parseArtifactTar(await extractArtifactTar(zipBytes));
                             } catch (error) {
@@ -1188,10 +1188,10 @@ export async function syncMirror(env, options = {}) {
                                 if (snapshotsBuilt >= MAX_TREE_SNAPSHOTS_PER_ROUND) {
                                     snapshotBudgetExhausted = true;
                                 } else {
-                                    detail = 'artifact unavailable; commit tree fallback';
+                                    detail = '预览版（逐个下载文件）';
                                     if ([401, 403, 410].includes(error.status)) {
                                         artifactFallbackWarning = new ArtifactUnavailableError(
-                                            `artifact unavailable; commit tree fallback: ${toErrorMessage(error)}`,
+                                            `${toErrorMessage(error)}，已改为逐个下载文件`,
                                             error.status
                                         );
                                     }
@@ -1251,7 +1251,7 @@ export async function syncMirror(env, options = {}) {
                                     tag: artifactTag,
                                     commit: artifactCommit,
                                     reason: error instanceof RpHubAppPatchError ? 'patch-rejected' : 'release-incomplete',
-                                    detail: `${detail}: ${toErrorMessage(error)}`,
+                                    detail: `${detail}：${toErrorMessage(error)}`,
                                     seenAt
                                 };
                                 addPending(manifest, pending);
@@ -1352,8 +1352,8 @@ export async function syncMirror(env, options = {}) {
         };
         await reportProgress(
             artifactSyncError ? 'error' : 'done',
-            artifactSyncError ? '同步失败' : (snapshotBudgetExhausted ? '本轮完成，仍有版本待回填' : '同步完成'),
-            `已发布 ${manifest.versions.length} 个版本`
+            artifactSyncError ? '同步失败' : (snapshotBudgetExhausted ? '部分完成，还有版本未收录' : '同步完成'),
+            `已收录 ${manifest.versions.length} 个版本`
         );
         if (artifactSyncError) {
             return {
@@ -1387,7 +1387,7 @@ export async function syncMirror(env, options = {}) {
             runtimeConfig.webhookEnabled
         );
         const safeError = safeErrorMessage(error, env);
-        await reportProgress('error', context.tag ? `同步失败于 ${context.tag}` : '同步失败', safeError);
+        await reportProgress('error', context.tag ? `同步失败（${context.tag}）` : '同步失败', safeError);
         console.error(JSON.stringify({
             message: 'mirror sync failed',
             tag: redactText(context.tag, env),
@@ -1472,12 +1472,12 @@ export async function syncTestReleases(env, options = {}) {
     const fetchImpl = options.fetchImpl || fetch;
     const now = options.now || Date.now;
     const bucket = env?.MIRROR_BUCKET;
-    if (!bucket) throw new Error('缺少 MIRROR_BUCKET R2 binding。');
+    if (!bucket) throw new Error('未绑定 R2 存储桶 MIRROR_BUCKET。');
     const repo = testReleaseRepo(env);
     const state = await readJsonObject(bucket, TEST_RELEASE_MANIFEST_KEY);
     const previous = new Map((Array.isArray(state.value?.versions) ? state.value.versions : []).map((version) => [version.tag, version]));
     const releases = await fetchGitHubJson(fetchImpl, env, `https://api.github.com/repos/${repo}/releases?per_page=30`);
-    if (!Array.isArray(releases)) throw new Error('测试版 Release 列表格式异常。');
+    if (!Array.isArray(releases)) throw new Error('GitHub 测试版列表格式异常。');
     const candidates = releases
         .filter((release) => !release?.draft && TEST_RELEASE_TAG_PATTERN.test(release?.tag_name))
         .sort((left, right) => compareReleaseVersions(right.tag_name, left.tag_name))
@@ -1573,23 +1573,26 @@ class WorkshopRequestError extends Error {
 // 从插件源码里读出 register 时写的 id、version、requiresApi；要求写成字面量，真正的加载检查由站点加载器负责。
 export function readPluginManifest(source) {
     const start = source.indexOf('RPHubSDK.register(');
-    if (start < 0) throw new WorkshopRequestError('插件里没有找到 RPHubSDK.register(');
+    if (start < 0) throw new WorkshopRequestError('插件文件中未找到 RPHubSDK.register');
     const head = source.slice(start, start + 4000);
     const text = (key) => head.match(new RegExp(`\\b${key}\\s*:\\s*(['"])([^'"\\n]{1,32})\\1`))?.[2] || '';
     const id = text('id');
     const version = text('version');
     const requiresApi = Number(head.match(/\brequiresApi\s*:\s*(\d{1,3})\b/)?.[1]);
     if (!WORKSHOP_ID_PATTERN.test(id) || !version || !Number.isInteger(requiresApi) || requiresApi < 1) {
-        throw new WorkshopRequestError('register 里的 id、version、requiresApi 要直接写成固定值；id 只用小写字母、数字和短横线，3～32 个字符');
+        throw new WorkshopRequestError('register 中的 id、version、requiresApi 必须写成固定值，id 只能包含小写字母、数字和短横线（3～32 个字符）');
     }
     return { id, version, requiresApi };
 }
 
-function readWorkshopText(body) {
+// 投稿页填的文字，插件和皮肤共用；报错用页面上的栏目名。
+const SUBMIT_TEXT_LABELS = { name: '名称', author: '作者', description: '说明', contact: '联系方式' };
+function readSubmitText(body, limits, required) {
     const meta = {};
-    for (const [key, limit] of Object.entries(WORKSHOP_TEXT_LIMITS)) {
+    for (const [key, limit] of Object.entries(limits)) {
         const value = typeof body?.[key] === 'string' ? body[key].trim() : '';
-        if ((key !== 'contact' && !value) || value.length > limit) throw new WorkshopRequestError(`${key} 需要 ${key === 'contact' ? 0 : 1}～${limit} 个字符`);
+        if (!value && required.includes(key)) throw new WorkshopRequestError(`请填写${SUBMIT_TEXT_LABELS[key]}`);
+        if (value.length > limit) throw new WorkshopRequestError(`${SUBMIT_TEXT_LABELS[key]}不能超过 ${limit} 个字`);
         meta[key] = value;
     }
     return meta;
@@ -1632,10 +1635,10 @@ export async function submitWorkshopPlugin(request, env, options = {}) {
     const bytes = new TextEncoder().encode(source);
     if (!source.trim() || bytes.byteLength > MAX_WORKSHOP_PLUGIN_BYTES) throw new WorkshopRequestError('插件文件不能为空，且不能超过 2MB');
     const manifest = readPluginManifest(source);
-    const meta = readWorkshopText(body);
+    const meta = readSubmitText(body, WORKSHOP_TEXT_LIMITS, ['name', 'author', 'description']);
     const pending = await listWorkshopPending(bucket);
     const replaced = pending.filter((entry) => entry.id === manifest.id);
-    if (pending.length - replaced.length >= MAX_WORKSHOP_PENDING) throw new WorkshopRequestError('待审核的投稿已满，请稍后再试', 429);
+    if (pending.length - replaced.length >= MAX_WORKSHOP_PENDING) throw new WorkshopRequestError('待审核投稿已满，请稍后重试', 429);
     const sid = crypto.randomUUID();
     const entry = { sid, ...manifest, ...meta, size: bytes.byteLength, sha256: await sha256Bytes(bytes), submittedAt: nowValue(now) };
     await bucket.put(`${WORKSHOP_PENDING_PREFIX}${sid}.js`, bytes, { httpMetadata: { contentType: 'text/javascript; charset=utf-8' } });
@@ -1660,7 +1663,7 @@ async function reviewWorkshop(action, request, env, options = {}) {
     if (action === 'remove') {
         const state = await readWorkshopIndexState(bucket);
         const plugins = state.plugins.filter((plugin) => plugin.id !== body?.id);
-        if (plugins.length === state.plugins.length) throw new WorkshopRequestError('插件不在工坊里', 404);
+        if (plugins.length === state.plugins.length) throw new WorkshopRequestError('插件不存在或已下架', 404);
         await writeWorkshopIndex(bucket, state, plugins, now);
         await bucket.delete(`${WORKSHOP_PREFIX}/plugins/${body.id}.js`);
         return { ok: true, removed: body.id };
@@ -1671,7 +1674,7 @@ async function reviewWorkshop(action, request, env, options = {}) {
         await bucket.delete(pendingKeys);
         return { ok: true, rejected: entry.sid };
     }
-    if (await sha256Bytes(bytes) !== entry.sha256) throw new WorkshopRequestError('投稿文件与记录不一致，请拒绝后让作者重新投稿', 409);
+    if (await sha256Bytes(bytes) !== entry.sha256) throw new WorkshopRequestError('投稿文件校验失败，请拒绝后让作者重新投稿', 409);
     const path = `/${WORKSHOP_PREFIX}/plugins/${entry.id}.js`;
     await bucket.put(path.slice(1), bytes, { httpMetadata: { contentType: 'text/javascript; charset=utf-8' } });
     const state = await readWorkshopIndexState(bucket);
@@ -1713,13 +1716,13 @@ async function serveWorkshop(pathname, env) {
 const SUBMIT_SCRIPT = String.raw`
 const byId=(id)=>document.getElementById(id);const MAX=2*1024*1024;let source='';let catalog=[];
 fetch('/workshop/index.json').then((r)=>r.ok?r.json():{plugins:[]}).then((v)=>{catalog=v.plugins||[];if(source)inspect()}).catch(()=>{});
-function readManifest(text){const at=text.indexOf('RPHubSDK.register(');if(at<0)return{error:'插件里没有找到 RPHubSDK.register(。'};const head=text.slice(at,at+4000);const pick=(key)=>(head.match(new RegExp('\\b'+key+'\\s*:\\s*([\'"])([^\'"\\n]{1,40})\\1'))||[])[2]||'';const id=pick('id'),version=pick('version'),name=pick('name');const api=Number((head.match(/\brequiresApi\s*:\s*(\d{1,3})\b/)||[])[1]);if(!/^[a-z0-9-]{3,32}$/.test(id)||!version||!api)return{error:'register 里的 id、version、requiresApi 要直接写成固定值；id 只用小写字母、数字和短横线，3～32 个字符。'};return{id,version,name,requiresApi:api}}
+function readManifest(text){const at=text.indexOf('RPHubSDK.register(');if(at<0)return{error:'插件文件中未找到 RPHubSDK.register。'};const head=text.slice(at,at+4000);const pick=(key)=>(head.match(new RegExp('\\b'+key+'\\s*:\\s*([\'"])([^\'"\\n]{1,40})\\1'))||[])[2]||'';const id=pick('id'),version=pick('version'),name=pick('name');const api=Number((head.match(/\brequiresApi\s*:\s*(\d{1,3})\b/)||[])[1]);if(!/^[a-z0-9-]{3,32}$/.test(id)||!version||!api)return{error:'register 中的 id、version、requiresApi 必须写成固定值，id 只能包含小写字母、数字和短横线（3～32 个字符）。'};return{id,version,name,requiresApi:api}}
 function check(kind,message){const box=byId('check');box.className='notice '+kind;box.textContent=message;box.hidden=false}
-function inspect(){const manifest=readManifest(source);byId('submit').disabled=true;if(manifest.error){byId('detected').hidden=true;check('error',manifest.error);return}const current=catalog.find((plugin)=>plugin.id===manifest.id);byId('dId').textContent=manifest.id;byId('dVersion').textContent=manifest.version;byId('dApi').textContent='API '+manifest.requiresApi;byId('dKind').textContent=current?'更新：工坊现有 v'+current.version+'（'+current.author+'）':'新插件';byId('dKind').className='badge '+(current?'warn':'ok');byId('detected').hidden=false;if(!byId('name').value&&(manifest.name||current))byId('name').value=(current&&current.name)||manifest.name;if(!byId('author').value&&current)byId('author').value=current.author;if(current&&current.version===manifest.version){check('warn','版本号和工坊里已上架的版本相同。更新插件请先改 register 里的 version。');return}check('ok','格式检查通过，填好下面的信息后提交审核。');byId('submit').disabled=false}
+function inspect(){const manifest=readManifest(source);byId('submit').disabled=true;if(manifest.error){byId('detected').hidden=true;check('error',manifest.error);return}const current=catalog.find((plugin)=>plugin.id===manifest.id);byId('dId').textContent=manifest.id;byId('dVersion').textContent=manifest.version;byId('dApi').textContent='API '+manifest.requiresApi;byId('dKind').textContent=current?'更新：已上架 v'+current.version+'（'+current.author+'）':'新插件';byId('dKind').className='badge '+(current?'warn':'ok');byId('detected').hidden=false;if(!byId('name').value&&(manifest.name||current))byId('name').value=(current&&current.name)||manifest.name;if(!byId('author').value&&current)byId('author').value=current.author;if(current&&current.version===manifest.version){check('warn','版本号与已上架版本相同，请先修改 register 中的 version。');return}check('ok','检查通过，请填写以下信息后提交审核。');byId('submit').disabled=false}
 const drop=byId('drop');['dragenter','dragover'].forEach((type)=>drop.addEventListener(type,(event)=>{event.preventDefault();drop.classList.add('dragging')}));['dragleave','drop'].forEach((type)=>drop.addEventListener(type,()=>drop.classList.remove('dragging')));drop.addEventListener('drop',(event)=>{event.preventDefault();if(!event.dataTransfer.files.length)return;byId('file').files=event.dataTransfer.files;byId('file').dispatchEvent(new Event('change'))});
-byId('file').addEventListener('change',async()=>{const file=byId('file').files[0];source='';byId('fileName').textContent=file?file.name:'选择插件文件';byId('fileHint').textContent=file?Math.max(1,Math.round(file.size/1024))+' KB · 点击更换文件':'点击选择，或把 .js 文件拖到这里，不超过 2MB';drop.classList.toggle('chosen',Boolean(file));byId('detected').hidden=true;byId('submit').disabled=true;if(!file){byId('check').hidden=true;return}if(file.size>MAX){check('error','插件文件不能超过 2MB。');return}source=await file.text();inspect()});
+byId('file').addEventListener('change',async()=>{const file=byId('file').files[0];source='';byId('fileName').textContent=file?file.name:'选择插件文件';byId('fileHint').textContent=file?Math.max(1,Math.round(file.size/1024))+' KB · 点击更换文件':'点击选择或拖入 .js 文件，不超过 2MB';drop.classList.toggle('chosen',Boolean(file));byId('detected').hidden=true;byId('submit').disabled=true;if(!file){byId('check').hidden=true;return}if(file.size>MAX){check('error','插件文件不能超过 2MB。');return}source=await file.text();inspect()});
 byId('description').addEventListener('input',()=>{byId('descCount').textContent=byId('description').value.length+' / 300'});
-byId('form').addEventListener('submit',async(event)=>{event.preventDefault();if(!source)return;byId('submit').disabled=true;check('','正在提交…');try{const response=await fetch('/api/workshop/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source,name:byId('name').value,author:byId('author').value,description:byId('description').value,contact:byId('contact').value})});const value=await response.json().catch(()=>({}));if(!response.ok)throw new Error(value.error||('HTTP '+response.status));byId('form').hidden=true;byId('doneText').textContent=value.id+' v'+value.version+' 已进入待审核。审核通过后会出现在首页的插件工坊里；同一插件再次投稿会替换这次的投稿。';byId('done').hidden=false}catch(error){check('error','提交失败：'+error.message);byId('submit').disabled=false}});
+byId('form').addEventListener('submit',async(event)=>{event.preventDefault();if(!source)return;byId('submit').disabled=true;check('','正在提交…');try{const response=await fetch('/api/workshop/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source,name:byId('name').value,author:byId('author').value,description:byId('description').value,contact:byId('contact').value})});const value=await response.json().catch(()=>({}));if(!response.ok)throw new Error(value.error||('HTTP '+response.status));byId('form').hidden=true;byId('doneText').textContent=value.id+' v'+value.version+' 已提交，审核通过后会显示在插件工坊。';byId('done').hidden=false}catch(error){check('error','提交失败：'+error.message);byId('submit').disabled=false}});
 byId('again').addEventListener('click',()=>{location.reload()});
 `;
 
@@ -1727,34 +1730,34 @@ function renderWorkshopSubmitHtml() {
     const main = `<div class="submit-layout">
 <section>
 <h1>投稿插件</h1>
-<p class="lead">上传插件后进入待审核，维护者看过代码再上架到插件工坊。更新已有插件也在这里提交。</p>
+<p class="lead">插件审核通过后会上架到插件工坊。更新已有插件也在这里提交。</p>
 <form id="form" class="card pad form" style="margin-top:20px">
-<div class="field"><span>插件文件</span><label id="drop" class="drop"><input id="file" class="visually-hidden" type="file" accept=".js,text/javascript"><span class="drop-icon" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></svg></span><span class="drop-text"><b id="fileName">选择插件文件</b><small id="fileHint">点击选择，或把 .js 文件拖到这里，不超过 2MB</small></span></label></div>
+<div class="field"><span>插件文件</span><label id="drop" class="drop"><input id="file" class="visually-hidden" type="file" accept=".js,text/javascript"><span class="drop-icon" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></svg></span><span class="drop-text"><b id="fileName">选择插件文件</b><small id="fileHint">点击选择或拖入 .js 文件，不超过 2MB</small></span></label></div>
 <div id="detected" class="detected" hidden><div class="meta"><span>id <code id="dId"></code></span><span>版本 <b id="dVersion"></b></span><span id="dApi"></span></div><span id="dKind" class="badge"></span></div>
 <p id="check" class="notice" hidden></p>
 <label class="field">名称<input id="name" maxlength="40" required></label>
 <label class="field">作者<input id="author" maxlength="40" required></label>
-<label class="field">说明<small>插件做什么；需要联网的写明会访问哪些地址。<span id="descCount">0 / 300</span></small><textarea id="description" maxlength="300" required></textarea></label>
-<label class="field">联系方式<small>选填，方便审核时联系你</small><input id="contact" maxlength="100"></label>
+<label class="field">说明<small><span id="descCount">0 / 300</span></small><textarea id="description" maxlength="300" required placeholder="介绍插件的功能；需要联网的写明访问哪些地址"></textarea></label>
+<label class="field">联系方式<small>选填</small><input id="contact" maxlength="100" placeholder="审核时用于联系你"></label>
 <div class="actions"><button id="submit" class="btn primary" type="submit" disabled>提交审核</button></div>
 </form>
-<div id="done" class="card pad" hidden style="margin-top:20px"><h2>已提交</h2><p id="doneText" class="notes"></p><div class="actions" style="margin-top:12px"><a class="btn primary" href="/#workshop">查看插件工坊</a><button id="again" class="btn" type="button">再投一个</button></div></div>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>已提交</h2><p id="doneText" class="notes"></p><div class="actions" style="margin-top:12px"><a class="btn primary" href="/#workshop">查看插件工坊</a><button id="again" class="btn" type="button">继续投稿</button></div></div>
 </section>
 <aside class="card pad side">
 <h2>投稿须知</h2>
 <ul>
-<li><code>RPHubSDK.register({ id: '…', version: '…', requiresApi: 4, … })</code> 里的 id、version、requiresApi 直接写成固定值。</li>
-<li>id 只用小写字母、数字和短横线，上架后不能改；更新时改 version。</li>
-<li>不读取、不上传同步密码和生图密钥；需要联网的在说明里写清楚。</li>
-<li>不要混淆或压缩代码，审核时要能看懂。</li>
+<li><code>RPHubSDK.register({ id: '…', version: '…', requiresApi: 4, … })</code> 中的 id、version、requiresApi 必须写成固定值。</li>
+<li>id 只能包含小写字母、数字和短横线，上架后不能修改；更新插件时修改 version。</li>
+<li>不得读取或上传同步密码和生图密钥；需要联网的请在说明中写明。</li>
+<li>不要混淆或压缩代码。</li>
 </ul>
 <h2>审核流程</h2>
 <ol>
-<li>提交后进入待审核区。</li>
-<li>维护者阅读代码，决定上架或拒绝。</li>
-<li>上架后出现在首页的插件工坊，站点在「模块管理 → 工坊」安装。</li>
+<li>提交后进入待审核。</li>
+<li>管理员审核代码后上架或拒绝。</li>
+<li>上架后显示在首页的插件工坊，站点可在「模块管理 → 工坊」中安装。</li>
 </ol>
-<p class="small muted">接口说明见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/WORKSHOP-MOD-GUIDE.md">工坊开发指南</a>，示范插件见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/examples/api-demo-module.js">api-demo-module.js</a>。</p>
+<p class="small muted">接口说明见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/WORKSHOP-MOD-GUIDE.md">工坊开发指南</a>，示例插件见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/examples/api-demo-module.js">api-demo-module.js</a>。</p>
 </aside>
 </div>`;
     const css = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:4px 0}.field{display:grid;gap:6px;font-weight:600}.drop{display:flex;align-items:center;gap:14px;padding:16px 18px;border:1.5px dashed var(--line);border-radius:12px;background:var(--surface-2);font-weight:400;cursor:pointer;transition:border-color .15s,background .15s}.drop:hover,.drop.dragging{border-color:var(--primary);background:var(--primary-soft)}.drop.chosen{border-style:solid}.drop:focus-within{outline:2px solid color-mix(in srgb,var(--primary) 45%,transparent);outline-offset:2px}.drop-icon{display:grid;place-items:center;flex:none;width:40px;height:40px;border-radius:10px;background:var(--primary);color:#fff}.drop-text{display:grid;min-width:0}.drop-text b{overflow-wrap:anywhere}.drop-text small{color:var(--muted)}.visually-hidden{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden}.detected{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-radius:10px;background:var(--surface-2)}@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
@@ -1778,38 +1781,28 @@ const MAX_SKIN_BYTES = 8 * 1024 * 1024;
 export function readSkinPackage(text) {
     let skin;
     try { skin = JSON.parse(text); } catch { throw new WorkshopRequestError('皮肤包不是有效的 JSON'); }
-    if (!plainObject(skin) || skin.schema !== 1) throw new WorkshopRequestError('皮肤包格式不对：schema 要是 1');
+    if (!plainObject(skin) || skin.schema !== 1) throw new WorkshopRequestError('皮肤包版本不支持（schema 应为 1）');
     const unknown = Object.keys(skin).filter((key) => !SKIN_KEYS.includes(key));
-    if (unknown.length) throw new WorkshopRequestError(`皮肤包里只能有图片和配色，不能包含 ${unknown.join('、')}`);
+    if (unknown.length) throw new WorkshopRequestError(`皮肤包只能包含图片和配色，不支持 ${unknown.join('、')}`);
     const images = (value, min, max) => Array.isArray(value) && value.length >= min && value.length <= max
         && value.every((item) => typeof item === 'string' && SKIN_IMAGE_PATTERN.test(item));
     const fail = (message) => { throw new WorkshopRequestError(message); };
     checkSkinLabels(skin);
-    if (typeof skin.version !== 'string' || !skin.version.trim() || skin.version.length > 32) fail('要写版本号 version');
-    if (!HEX_COLOR_PATTERN.test(skin.accent || '')) fail('主题色 accent 要写成 #rrggbb');
-    if (skin.neutral !== undefined && !HEX_COLOR_PATTERN.test(skin.neutral)) fail('底色 neutral 要写成 #rrggbb');
-    if (skin.colors !== undefined && !(Array.isArray(skin.colors) && skin.colors.length <= 8 && skin.colors.every((color) => HEX_COLOR_PATTERN.test(color)))) fail('备选颜色 colors 最多 8 个 #rrggbb');
-    if (!images(skin.art, 1, 4)) fail('art 要有 1～4 张图（webp、png 或 jpeg 的 data 地址）');
-    if (skin.wide !== undefined && !images(skin.wide, 0, 4)) fail('wide 最多 4 张图');
-    if (skin.icons !== undefined && !(typeof skin.icons === 'string' && SKIN_IMAGE_PATTERN.test(skin.icons))) fail('图标表 icons 要是一张图');
+    if (typeof skin.version !== 'string' || !skin.version.trim() || skin.version.length > 32) fail('缺少版本号 version');
+    if (!HEX_COLOR_PATTERN.test(skin.accent || '')) fail('主题色 accent 格式应为 #rrggbb');
+    if (skin.neutral !== undefined && !HEX_COLOR_PATTERN.test(skin.neutral)) fail('底色 neutral 格式应为 #rrggbb');
+    if (skin.colors !== undefined && !(Array.isArray(skin.colors) && skin.colors.length <= 8 && skin.colors.every((color) => HEX_COLOR_PATTERN.test(color)))) fail('备选颜色 colors 最多 8 个，格式为 #rrggbb');
+    if (!images(skin.art, 1, 4)) fail('竖图 art 需要 1～4 张（webp、png 或 jpeg）');
+    if (skin.wide !== undefined && !images(skin.wide, 0, 4)) fail('横图 wide 最多 4 张');
+    if (skin.icons !== undefined && !(typeof skin.icons === 'string' && SKIN_IMAGE_PATTERN.test(skin.icons))) fail('图标表 icons 必须是一张图片');
     return { ...skin, version: skin.version.trim(), name: skin.name.trim(), note: (skin.note || '').trim() };
 }
 
 // id、名称、出处：皮肤包里的和投稿页上改过的都按这个查。
 function checkSkinLabels(skin) {
-    if (!WORKSHOP_ID_PATTERN.test(skin.id || '')) throw new WorkshopRequestError('id 只用小写字母、数字和短横线，3～32 个字符');
-    if (typeof skin.name !== 'string' || !skin.name.trim() || skin.name.length > 20) throw new WorkshopRequestError('名称 name 要 1～20 个字');
+    if (!WORKSHOP_ID_PATTERN.test(skin.id || '')) throw new WorkshopRequestError('id 只能包含小写字母、数字和短横线（3～32 个字符）');
+    if (typeof skin.name !== 'string' || !skin.name.trim() || skin.name.length > 20) throw new WorkshopRequestError('名称 name 需要 1～20 个字');
     if (skin.note !== undefined && (typeof skin.note !== 'string' || skin.note.length > 40)) throw new WorkshopRequestError('出处 note 不能超过 40 个字');
-}
-
-function readSkinText(body) {
-    const meta = {};
-    for (const [key, limit] of Object.entries(SKIN_TEXT_LIMITS)) {
-        const value = typeof body?.[key] === 'string' ? body[key].trim() : '';
-        if ((key === 'author' && !value) || value.length > limit) throw new WorkshopRequestError(`${key} 需要 ${key === 'author' ? 1 : 0}～${limit} 个字符`);
-        meta[key] = value;
-    }
-    return meta;
 }
 
 async function listSkinPending(bucket) {
@@ -1840,10 +1833,10 @@ export async function submitSkin(request, env, options = {}) {
     const skin = readSkinPackage(source);
     for (const key of ['id', 'name', 'note']) if (typeof body[key] === 'string' && body[key].trim()) skin[key] = body[key].trim();
     checkSkinLabels(skin);
-    const meta = readSkinText(body);
+    const meta = readSubmitText(body, SKIN_TEXT_LIMITS, ['author']);
     const pending = await listSkinPending(bucket);
     const replaced = pending.filter((entry) => entry.id === skin.id);
-    if (pending.length - replaced.length >= MAX_WORKSHOP_PENDING) throw new WorkshopRequestError('待审核的投稿已满，请稍后再试', 429);
+    if (pending.length - replaced.length >= MAX_WORKSHOP_PENDING) throw new WorkshopRequestError('待审核投稿已满，请稍后重试', 429);
     const bytes = new TextEncoder().encode(JSON.stringify(skin));
     const sid = crypto.randomUUID();
     const entry = { sid, id: skin.id, version: skin.version, name: skin.name, note: skin.note, accent: skin.accent, ...meta, size: bytes.byteLength, sha256: await sha256Bytes(bytes), submittedAt: nowValue(now) };
@@ -1885,7 +1878,7 @@ async function reviewSkins(action, request, env, options = {}) {
     };
     if (action === 'remove') {
         const target = skins.find((skin) => skin.id === body?.id);
-        if (!target) throw new WorkshopRequestError('皮肤不在工坊里', 404);
+        if (!target) throw new WorkshopRequestError('皮肤不存在或已下架', 404);
         await write(skins.filter((skin) => skin !== target));
         await bucket.delete([target.file.path.slice(1), target.cover.path.slice(1)]);
         return { ok: true, removed: target.id };
@@ -1895,7 +1888,7 @@ async function reviewSkins(action, request, env, options = {}) {
         await bucket.delete(skinPendingKeys(entry.sid));
         return { ok: true, rejected: entry.sid };
     }
-    if (await sha256Bytes(bytes) !== entry.sha256) throw new WorkshopRequestError('投稿文件与记录不一致，请拒绝后让作者重新投稿', 409);
+    if (await sha256Bytes(bytes) !== entry.sha256) throw new WorkshopRequestError('投稿文件校验失败，请拒绝后让作者重新投稿', 409);
     const skin = readSkinPackage(new TextDecoder().decode(bytes));
     const [, type, data] = /^data:image\/(webp|png|jpeg);base64,([^#]+)/.exec(skin.art[0]);
     const cover = Uint8Array.from(atob(data), (character) => character.charCodeAt(0));
@@ -1919,11 +1912,11 @@ const SKIN_SUBMIT_SCRIPT = String.raw`
 const byId=(id)=>document.getElementById(id);const MAX=8*1024*1024;let source='';let catalog=[];
 fetch('/workshop/skins/index.json').then((r)=>r.ok?r.json():{skins:[]}).then((v)=>{catalog=v.skins||[];if(source)inspect()}).catch(()=>{});
 function check(kind,message){const box=byId('check');box.className='notice '+kind;box.textContent=message;box.hidden=false}
-function inspect(){byId('submit').disabled=true;let skin;try{skin=JSON.parse(source)}catch{byId('detected').hidden=true;check('error','这不是皮肤包。');return}if(!skin||skin.schema!==1||!Array.isArray(skin.art)||!skin.art.length){byId('detected').hidden=true;check('error','这不是皮肤包。');return}const images=[...skin.art,...(skin.wide||[])].map((url)=>{const img=document.createElement('img');img.src=url;img.alt='';return img});if(skin.icons){const img=document.createElement('img');img.src=skin.icons;img.alt='';img.className='icons';images.push(img)}byId('preview').replaceChildren(...images);byId('dots').replaceChildren(...[skin.accent,...(skin.colors||[])].filter(Boolean).map((color)=>{const dot=document.createElement('span');dot.className='dot';dot.style.background=color;dot.title=color;return dot}));if(!byId('id').value)byId('id').value=skin.id||'';if(!byId('name').value)byId('name').value=skin.name||'';if(!byId('note').value)byId('note').value=skin.note||'';byId('dVersion').textContent=skin.version||'';byId('detected').hidden=false;const current=catalog.find((item)=>item.id===byId('id').value.trim());byId('dKind').textContent=current?'更新：皮肤工坊现有 v'+current.version+'（'+current.author+'）':'新皮肤';byId('dKind').className='badge '+(current?'warn':'ok');if(current&&!byId('author').value)byId('author').value=current.author;if(current&&current.version===skin.version){check('warn','版本号和皮肤工坊里已上架的版本相同。更新皮肤请先改皮肤包里的 version。');return}check('ok','格式检查通过，填好下面的信息后提交审核。');byId('submit').disabled=false}
+function inspect(){byId('submit').disabled=true;let skin;try{skin=JSON.parse(source)}catch{byId('detected').hidden=true;check('error','不是有效的皮肤包。');return}if(!skin||skin.schema!==1||!Array.isArray(skin.art)||!skin.art.length){byId('detected').hidden=true;check('error','不是有效的皮肤包。');return}const images=[...skin.art,...(skin.wide||[])].map((url)=>{const img=document.createElement('img');img.src=url;img.alt='';return img});if(skin.icons){const img=document.createElement('img');img.src=skin.icons;img.alt='';img.className='icons';images.push(img)}byId('preview').replaceChildren(...images);byId('dots').replaceChildren(...[skin.accent,...(skin.colors||[])].filter(Boolean).map((color)=>{const dot=document.createElement('span');dot.className='dot';dot.style.background=color;dot.title=color;return dot}));if(!byId('id').value)byId('id').value=skin.id||'';if(!byId('name').value)byId('name').value=skin.name||'';if(!byId('note').value)byId('note').value=skin.note||'';byId('dVersion').textContent=skin.version||'';byId('detected').hidden=false;const current=catalog.find((item)=>item.id===byId('id').value.trim());byId('dKind').textContent=current?'更新：已上架 v'+current.version+'（'+current.author+'）':'新皮肤';byId('dKind').className='badge '+(current?'warn':'ok');if(current&&!byId('author').value)byId('author').value=current.author;if(current&&current.version===skin.version){check('warn','版本号与已上架版本相同，请先修改皮肤包中的 version。');return}check('ok','检查通过，请填写以下信息后提交审核。');byId('submit').disabled=false}
 const drop=byId('drop');['dragenter','dragover'].forEach((type)=>drop.addEventListener(type,(event)=>{event.preventDefault();drop.classList.add('dragging')}));['dragleave','drop'].forEach((type)=>drop.addEventListener(type,()=>drop.classList.remove('dragging')));drop.addEventListener('drop',(event)=>{event.preventDefault();if(!event.dataTransfer.files.length)return;byId('file').files=event.dataTransfer.files;byId('file').dispatchEvent(new Event('change'))});
-byId('file').addEventListener('change',async()=>{const file=byId('file').files[0];source='';byId('fileName').textContent=file?file.name:'选择皮肤包';byId('fileHint').textContent=file?Math.max(1,Math.round(file.size/1024))+' KB · 点击更换文件':'点击选择，或把 .json 文件拖到这里，不超过 8MB';drop.classList.toggle('chosen',Boolean(file));byId('detected').hidden=true;byId('submit').disabled=true;if(!file){byId('check').hidden=true;return}if(file.size>MAX){check('error','皮肤包不能超过 8MB。');return}source=await file.text();inspect()});
+byId('file').addEventListener('change',async()=>{const file=byId('file').files[0];source='';byId('fileName').textContent=file?file.name:'选择皮肤包';byId('fileHint').textContent=file?Math.max(1,Math.round(file.size/1024))+' KB · 点击更换文件':'点击选择或拖入 .json 文件，不超过 8MB';drop.classList.toggle('chosen',Boolean(file));byId('detected').hidden=true;byId('submit').disabled=true;if(!file){byId('check').hidden=true;return}if(file.size>MAX){check('error','皮肤包不能超过 8MB。');return}source=await file.text();inspect()});
 byId('id').addEventListener('change',()=>{if(source)inspect()});
-byId('form').addEventListener('submit',async(event)=>{event.preventDefault();if(!source)return;byId('submit').disabled=true;check('','正在提交…');try{const response=await fetch('/api/workshop/skins/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source,id:byId('id').value,name:byId('name').value,note:byId('note').value,author:byId('author').value,description:byId('description').value,contact:byId('contact').value})});const value=await response.json().catch(()=>({}));if(!response.ok)throw new Error(value.error||('HTTP '+response.status));byId('form').hidden=true;byId('doneText').textContent=value.id+' v'+value.version+' 已进入待审核。审核通过后会出现在首页的皮肤工坊里；同一皮肤再次投稿会替换这次的投稿。';byId('done').hidden=false}catch(error){check('error','提交失败：'+error.message);byId('submit').disabled=false}});
+byId('form').addEventListener('submit',async(event)=>{event.preventDefault();if(!source)return;byId('submit').disabled=true;check('','正在提交…');try{const response=await fetch('/api/workshop/skins/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source,id:byId('id').value,name:byId('name').value,note:byId('note').value,author:byId('author').value,description:byId('description').value,contact:byId('contact').value})});const value=await response.json().catch(()=>({}));if(!response.ok)throw new Error(value.error||('HTTP '+response.status));byId('form').hidden=true;byId('doneText').textContent=value.id+' v'+value.version+' 已提交，审核通过后会显示在皮肤工坊。';byId('done').hidden=false}catch(error){check('error','提交失败：'+error.message);byId('submit').disabled=false}});
 byId('again').addEventListener('click',()=>{location.reload()});
 `;
 
@@ -1931,33 +1924,33 @@ function renderSkinSubmitHtml() {
     const main = `<div class="submit-layout">
 <section>
 <h1>投稿皮肤</h1>
-<p class="lead">上传后进入待审核，审核通过就会出现在皮肤工坊。更新已有的皮肤也在这里提交。</p>
+<p class="lead">皮肤审核通过后会上架到皮肤工坊。更新已有皮肤也在这里提交。</p>
 <form id="form" class="card pad form" style="margin-top:20px">
-<div class="field"><span>皮肤包</span><label id="drop" class="drop"><input id="file" class="visually-hidden" type="file" accept=".json,application/json"><span class="drop-icon" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></svg></span><span class="drop-text"><b id="fileName">选择皮肤包</b><small id="fileHint">点击选择，或把 .json 文件拖到这里，不超过 8MB</small></span></label></div>
+<div class="field"><span>皮肤包</span><label id="drop" class="drop"><input id="file" class="visually-hidden" type="file" accept=".json,application/json"><span class="drop-icon" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></svg></span><span class="drop-text"><b id="fileName">选择皮肤包</b><small id="fileHint">点击选择或拖入 .json 文件，不超过 8MB</small></span></label></div>
 <div id="detected" class="detected-skin" hidden><div id="preview" class="skin-preview"></div><div class="meta"><span id="dots" class="dots"></span><span>版本 <b id="dVersion"></b></span><span id="dKind" class="badge"></span></div></div>
 <p id="check" class="notice" hidden></p>
-<label class="field">id<small>小写字母、数字和短横线，上架后不能改</small><input id="id" maxlength="32" pattern="[a-z0-9\\-]{3,32}" required></label>
+<label class="field">id<small>小写字母、数字和短横线，上架后不能修改</small><input id="id" maxlength="32" pattern="[a-z0-9\\-]{3,32}" required></label>
 <label class="field">名称<input id="name" maxlength="20" required></label>
-<label class="field">出处<small>选填，比如角色出自哪个游戏</small><input id="note" maxlength="40"></label>
+<label class="field">出处<small>选填</small><input id="note" maxlength="40" placeholder="角色出自的游戏或作品"></label>
 <label class="field">作者<input id="author" maxlength="40" required></label>
 <label class="field">说明<small>选填</small><textarea id="description" maxlength="300"></textarea></label>
-<label class="field">联系方式<small>选填，方便审核时联系你</small><input id="contact" maxlength="100"></label>
+<label class="field">联系方式<small>选填</small><input id="contact" maxlength="100" placeholder="审核时用于联系你"></label>
 <div class="actions"><button id="submit" class="btn primary" type="submit" disabled>提交审核</button></div>
 </form>
-<div id="done" class="card pad" hidden style="margin-top:20px"><h2>已提交</h2><p id="doneText" class="notes"></p><div class="actions" style="margin-top:12px"><a class="btn primary" href="/#skins">查看皮肤工坊</a><button id="again" class="btn" type="button">再投一个</button></div></div>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>已提交</h2><p id="doneText" class="notes"></p><div class="actions" style="margin-top:12px"><a class="btn primary" href="/#skins">查看皮肤工坊</a><button id="again" class="btn" type="button">继续投稿</button></div></div>
 </section>
 <aside class="card pad side">
-<h2>皮肤包是什么</h2>
+<h2>关于皮肤包</h2>
 <ul>
-<li>一个 .json 文件，里面只有图片和配色，不含代码。</li>
-<li>在「设置 → 皮肤」里选「自定义」，上传图片、调好颜色后点「导出皮肤包」就能得到。</li>
-<li>竖图用在手机上，横图用在电脑上。电脑上聊天栏在屏幕中间，横图里的人物最好放在左边或右边。</li>
+<li>皮肤包是一个 .json 文件，只包含图片和配色，不含代码。</li>
+<li>在「设置 → 皮肤」中选择「自定义」，上传图片并调整颜色后，点击「导出皮肤包」即可生成。</li>
+<li>竖图用于手机，横图用于电脑；横图的人物建议靠左或靠右，避开中间的聊天栏。</li>
 </ul>
 <h2>审核流程</h2>
 <ol>
-<li>提交后进入待审核区。</li>
-<li>维护者看过后决定上架或拒绝。</li>
-<li>上架后出现在首页的皮肤工坊，站点在「设置 → 皮肤」下载。</li>
+<li>提交后进入待审核。</li>
+<li>管理员审核后上架或拒绝。</li>
+<li>上架后显示在首页的皮肤工坊，站点可在「设置 → 皮肤」中下载。</li>
 </ol>
 </aside>
 </div>`;
@@ -2025,7 +2018,7 @@ function publicManifest(value, env) {
 
 async function buildStatus(env) {
     const bucket = env?.MIRROR_BUCKET;
-    if (!bucket) throw new Error('缺少 MIRROR_BUCKET R2 binding。');
+    if (!bucket) throw new Error('未绑定 R2 存储桶 MIRROR_BUCKET。');
     let manifestValue = null;
     let syncError = null;
     try {
@@ -2087,7 +2080,7 @@ async function buildStatus(env) {
 
 async function buildPublicStatus(env) {
     const bucket = env?.MIRROR_BUCKET;
-    if (!bucket) throw new Error('缺少 MIRROR_BUCKET R2 binding。');
+    if (!bucket) throw new Error('未绑定 R2 存储桶 MIRROR_BUCKET。');
     let manifestValue = null;
     try {
         manifestValue = (await readJsonObject(bucket, MANIFEST_KEY)).value;
@@ -2116,7 +2109,7 @@ function escapeHtml(value) {
 
 function formatStatusTime(value) {
     const timestamp = Number(value);
-    if (!Number.isFinite(timestamp) || timestamp <= 0) return '尚无记录';
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return '—';
     const parts = new Intl.DateTimeFormat('zh-CN', {
         timeZone: 'Asia/Shanghai',
         year: 'numeric',
@@ -2194,6 +2187,7 @@ input:focus,textarea:focus{outline:2px solid color-mix(in srgb,var(--primary) 45
 input[type=checkbox]{width:auto;accent-color:var(--primary)}
 .ask{width:min(480px,calc(100vw - 32px));padding:20px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--text)}
 .ask::backdrop{background:rgb(0 0 0/.45)}
+.ask h2{margin-bottom:8px}
 .ask p{margin:0 0 16px;white-space:pre-wrap;overflow-wrap:anywhere}
 .ask .actions{justify-content:flex-end}
 textarea{min-height:96px;resize:vertical}
@@ -2229,20 +2223,20 @@ class DeployError extends Error {
 
 // Cloudflare 的报错是英文，给不熟悉的人配上中文说明；原文附在后面方便排查。
 const CF_ERROR_HINTS = [
-    [/subdomain is unavailable|subdomain.*already in use/i, '这个项目名对应的 pages.dev 网址已经被别人用了（所有 Cloudflare 用户共用一套网址），请换一个更独特的项目名，比如加上你的名字缩写。'],
-    [/invalid api token|invalid access token|authentication error|unauthorized/i, '令牌无效：可能复制时少了字符、已过期或已被删除。请重新创建令牌，完整复制后再填。'],
-    [/permission|not authorized|forbidden|insufficient/i, '令牌缺少需要的权限：请按右侧「创建令牌」的说明，把列出的权限都加上，帐户资源要选你部署的那个帐户。'],
-    [/please enable r2|r2.*(not enabled|subscri|purchase)|enable.*r2/i, '这个帐户还没开通 R2：到 Cloudflare 后台左侧「R2 对象存储」开通（免费额度内不扣费），然后再部署。'],
-    [/maximum number of projects|project limit/i, '这个帐户的 Pages 项目数量已达上限：到 Cloudflare 后台删掉不用的项目再部署。'],
-    [/rate limit|too many requests/i, '请求太频繁，被 Cloudflare 暂时限制了：等一两分钟再试。'],
-    [/domain.*(already|in use|another project)/i, '这个域名已经绑定在别的 Pages 项目上：先在那个项目的「自定义域」里删掉，再重新部署。'],
-    [/bucket.*(invalid|name)/i, '存储桶名不符合 Cloudflare 的要求：只用小写字母、数字和短横线，3～63 个字符，不能以短横线开头或结尾。'],
-    [/project.*not found/i, '找不到这个 Pages 项目：可能刚被删除，请刷新页面重试。']
+    [/subdomain is unavailable|subdomain.*already in use/i, '该项目名的 pages.dev 网址已被占用，请换一个项目名，例如加上名字缩写。'],
+    [/invalid api token|invalid access token|authentication error|unauthorized/i, '令牌无效，可能已过期、已删除或复制不完整，请重新创建并完整复制。'],
+    [/permission|not authorized|forbidden|insufficient/i, '令牌权限不足，请按「创建令牌」的步骤添加所有权限，并在帐户资源中选择要部署的帐户。'],
+    [/please enable r2|r2.*(not enabled|subscri|purchase)|enable.*r2/i, '该帐户未开通 R2，请在 Cloudflare 后台「R2 对象存储」中开通（免费额度内不收费）后再部署。'],
+    [/maximum number of projects|project limit/i, '该帐户的 Pages 项目数量已达上限，请在 Cloudflare 后台删除不用的项目后再部署。'],
+    [/rate limit|too many requests/i, '请求过于频繁，请 1～2 分钟后重试。'],
+    [/domain.*(already|in use|another project)/i, '该域名已绑定到其他 Pages 项目，请先在该项目的「自定义域」中移除后再部署。'],
+    [/bucket.*(invalid|name)/i, '存储桶名无效，只能包含小写字母、数字和短横线，长度 3～63 个字符，且不能以短横线开头或结尾。'],
+    [/project.*not found/i, '找不到该 Pages 项目，请刷新页面后重试。']
 ];
 
 function explainCfError(detail, status) {
     const hint = CF_ERROR_HINTS.find(([pattern]) => pattern.test(detail))?.[1]
-        || (status === 401 || status === 403 ? CF_ERROR_HINTS[2][1] : status >= 500 ? 'Cloudflare 那边暂时出错了，稍等几分钟再试。' : '');
+        || (status === 401 || status === 403 ? CF_ERROR_HINTS[2][1] : status >= 500 ? 'Cloudflare 服务暂时异常，请几分钟后重试。' : '');
     return hint ? `${hint}（Cloudflare 原文：${detail}）` : `Cloudflare 返回错误：${detail}`;
 }
 
@@ -2263,7 +2257,7 @@ async function listDeployAccounts(token, fetchImpl) {
     try {
         return (await cfCall(fetchImpl, token, '/accounts?per_page=50')).map((account) => ({ id: account.id, name: account.name || account.id }));
     } catch (error) {
-        if (error.cfStatus === 401 || error.cfStatus === 403) throw new DeployError('令牌无效或权限不足，请按页面说明创建令牌。', 'TOKEN_INVALID', 403);
+        if (error.cfStatus === 401 || error.cfStatus === 403) throw new DeployError('令牌无效或权限不足，请按「创建令牌」的步骤重新创建。', 'TOKEN_INVALID', 403);
         throw error;
     }
 }
@@ -2271,12 +2265,12 @@ async function listDeployAccounts(token, fetchImpl) {
 async function readLatestTestBundle(bucket) {
     const manifest = await readJsonObject(bucket, TEST_RELEASE_MANIFEST_KEY).then((result) => result.value).catch(() => null);
     const version = Array.isArray(manifest?.versions) ? manifest.versions[0] : null;
-    if (!version?.tag) throw new DeployError('分发站还没有测试版，暂时不能部署。', 'NO_RELEASE', 503);
+    if (!version?.tag) throw new DeployError('暂无可部署的测试版。', 'NO_RELEASE', 503);
     const object = await bucket.get(`${TEST_RELEASE_PREFIX}/${version.tag}/bundle.json`);
-    if (!object) throw new DeployError('测试版发布包缺失，请稍后再试。', 'NO_RELEASE', 503);
+    if (!object) throw new DeployError('测试版文件缺失，请稍后重试。', 'NO_RELEASE', 503);
     const bundle = JSON.parse(await object.text());
     if (bundle?.format !== 'rph-release-bundle-v1' || typeof bundle.worker !== 'string' || !Array.isArray(bundle.assets)) {
-        throw new DeployError('测试版发布包格式无效。', 'NO_RELEASE', 503);
+        throw new DeployError('测试版文件格式无效。', 'NO_RELEASE', 503);
     }
     return bundle;
 }
@@ -2315,13 +2309,13 @@ async function uploadPagesBundle(fetchImpl, token, account, project, bundle) {
 
 // 自定义域名：先加到 Pages 项目；域名托管在同一帐户时再补一条 CNAME。缺权限或已有记录指向别处时不覆盖，返回手动操作说明。
 async function attachCustomDomain(fetchImpl, token, account, project, domain, subdomain) {
-    const manual = `在域名的 DNS 里添加 CNAME 记录：${domain} → ${subdomain}`;
+    const manual = `请在域名的 DNS 中添加 CNAME 记录：${domain} → ${subdomain}`;
     try {
         await cfCall(fetchImpl, token, `/accounts/${account}/pages/projects/${project}/domains`, {
             method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: domain })
         });
     } catch (error) {
-        if (!/already|exist/i.test(error.detail || '') || /another project/i.test(error.detail || '')) return { name: domain, status: 'failed', message: `域名没能加到项目：${error.message}` };
+        if (!/already|exist/i.test(error.detail || '') || /another project/i.test(error.detail || '')) return { name: domain, status: 'failed', message: `域名添加失败：${error.message}` };
     }
     const labels = domain.split('.');
     let zone = null;
@@ -2333,16 +2327,16 @@ async function attachCustomDomain(fetchImpl, token, account, project, domain, su
     } catch (_) {
         return { name: domain, status: 'manual', message: `令牌没有读取域名的权限。${manual}` };
     }
-    if (!zone) return { name: domain, status: 'manual', message: `这个域名不在该 Cloudflare 帐户里。${manual}` };
+    if (!zone) return { name: domain, status: 'manual', message: `该域名不在此 Cloudflare 帐户中。${manual}` };
     try {
         const records = await cfCall(fetchImpl, token, `/zones/${zone.id}/dns_records?name=${domain}`);
         if (records.some((item) => item.type === 'CNAME' && item.content === subdomain)) return { name: domain, status: 'ready', message: 'DNS 记录已存在。' };
-        if (records.length) return { name: domain, status: 'manual', message: `${domain} 已有其他 DNS 记录，没有覆盖。需要时把它改成 CNAME → ${subdomain}。` };
+        if (records.length) return { name: domain, status: 'manual', message: `${domain} 已有其他 DNS 记录，未覆盖。如需使用，请改为 CNAME → ${subdomain}。` };
         await cfCall(fetchImpl, token, `/zones/${zone.id}/dns_records`, {
             method: 'POST', headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ type: 'CNAME', name: domain, content: subdomain, proxied: true })
         });
-        return { name: domain, status: 'ready', message: '已自动添加 DNS 记录，证书签发通常要几分钟。' };
+        return { name: domain, status: 'ready', message: '已自动添加 DNS 记录，证书通常几分钟内生效。' };
     } catch (_) {
         return { name: domain, status: 'manual', message: `令牌没有修改 DNS 的权限。${manual}` };
     }
@@ -2352,13 +2346,13 @@ async function attachCustomDomain(fetchImpl, token, account, project, domain, su
 async function resolveDeployAccount(fetchImpl, token, accountId) {
     const accounts = await listDeployAccounts(token, fetchImpl);
     const account = String(accountId || '').trim();
-    if (account && !DEPLOY_ACCOUNT_PATTERN.test(account)) throw new DeployError('帐户 ID 格式不对，应为 32 位字符。');
+    if (account && !DEPLOY_ACCOUNT_PATTERN.test(account)) throw new DeployError('帐户 ID 格式错误，应为 32 位字符。');
     if (!account) {
         if (accounts.length === 1) return accounts[0].id;
-        if (accounts.length > 1) throw new DeployError('令牌能访问多个帐户，请先选择用哪个帐户。', 'CHOOSE_ACCOUNT');
-        throw new DeployError('令牌查不到帐户：请给令牌加上「帐户设置：读取」权限，或手动填写帐户 ID。', 'NEED_ACCOUNT');
+        if (accounts.length > 1) throw new DeployError('令牌可以访问多个帐户，请选择要使用的帐户。', 'CHOOSE_ACCOUNT');
+        throw new DeployError('未找到帐户，请为令牌添加「帐户 → 帐户设置 → 读取」权限，或手动填写帐户 ID。', 'NEED_ACCOUNT');
     }
-    if (accounts.length && !accounts.some((item) => item.id === account)) throw new DeployError('令牌没有这个帐户的权限。', 'TOKEN_INVALID', 403);
+    if (accounts.length && !accounts.some((item) => item.id === account)) throw new DeployError('令牌没有该帐户的权限。', 'TOKEN_INVALID', 403);
     return account;
 }
 
@@ -2390,10 +2384,10 @@ async function runDeploy(request, env, options) {
     const bucketName = String(body?.bucketName || '').trim().toLowerCase();
     if (!token) throw new DeployError('请填写 Cloudflare 令牌。');
     if (password.length < 6) throw new DeployError('同步密码至少 6 位。');
-    if (!DEPLOY_PROJECT_PATTERN.test(projectName)) throw new DeployError('项目名只能用小写字母、数字和短横线，最多 58 个字符。');
-    if (!DEPLOY_BUCKET_PATTERN.test(bucketName)) throw new DeployError('存储桶名只能用小写字母、数字和短横线，3～63 个字符。');
+    if (!DEPLOY_PROJECT_PATTERN.test(projectName)) throw new DeployError('项目名只能包含小写字母、数字和短横线，最多 58 个字符。');
+    if (!DEPLOY_BUCKET_PATTERN.test(bucketName)) throw new DeployError('存储桶名只能包含小写字母、数字和短横线，长度 3～63 个字符。');
     const customDomain = String(body?.customDomain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-    if (customDomain && (!DEPLOY_DOMAIN_PATTERN.test(customDomain) || customDomain.endsWith('.pages.dev'))) throw new DeployError('自定义域名格式不对，例如 rph.example.com。');
+    if (customDomain && (!DEPLOY_DOMAIN_PATTERN.test(customDomain) || customDomain.endsWith('.pages.dev'))) throw new DeployError('自定义域名格式错误，例如 rph.example.com。');
     const account = await resolveDeployAccount(fetchImpl, token, body?.accountId);
     const bundle = await readLatestTestBundle(env.MIRROR_BUCKET);
 
@@ -2407,8 +2401,8 @@ async function runDeploy(request, env, options) {
     const currentBucket = project?.deployment_configs?.production?.r2_buckets?.RP_SYNC_R2?.name || '';
     if (project && body?.overwrite !== true) {
         throw new DeployError(currentBucket
-            ? `项目「${projectName}」已存在，它现在用的存储桶是「${currentBucket}」。继续会用最新测试版覆盖它并重新设置同步密码，存储桶照旧用「${currentBucket}」。`
-            : `项目「${projectName}」已存在。继续会用最新测试版覆盖它，并重新设置存储桶绑定和同步密码。`, 'PROJECT_EXISTS', 409);
+            ? `项目「${projectName}」已存在，覆盖后会部署最新测试版并重新设置同步密码，存储桶继续使用「${currentBucket}」。`
+            : `项目「${projectName}」已存在，覆盖后会部署最新测试版，并重新设置存储桶和同步密码。`, 'PROJECT_EXISTS', 409);
     }
     // 项目名同时是 *.pages.dev 网址，全体 Cloudflare 用户共用；被别人占用时加随机后缀重试。
     for (let attempt = 0; !project; attempt += 1) {
@@ -2434,7 +2428,7 @@ async function runDeploy(request, env, options) {
             method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: syncBucket })
         }).catch((error) => {
             if (/enable r2|r2.*(not enabled|subscri|purchase)|activat/i.test(error.detail || '')) {
-                throw new DeployError(explainCfError(error.detail, 409).replace(/^Cloudflare 返回错误：/, '这个帐户还没开通 R2，请到 Cloudflare 后台「R2 对象存储」开通后再部署：'), 'R2_NOT_ENABLED', 409);
+                throw new DeployError(explainCfError(error.detail, 409).replace(/^Cloudflare 返回错误：/, '该帐户未开通 R2，请在 Cloudflare 后台「R2 对象存储」中开通后再部署：'), 'R2_NOT_ENABLED', 409);
             }
             throw error;
         });
@@ -2494,7 +2488,7 @@ async function runMigration(fetchImpl, env, token, account, body) {
     const projectPath = `/accounts/${account}/pages/projects/${projectName}`;
     const project = await cfCall(fetchImpl, token, projectPath);
     const bucketName = project.deployment_configs?.production?.r2_buckets?.RP_SYNC_R2?.name;
-    if (!bucketName) throw new DeployError('这个项目没有绑定 RP_SYNC_R2 存储桶，不是魔改版站点。');
+    if (!bucketName) throw new DeployError('该项目没有绑定 RP_SYNC_R2 存储桶，不是魔改版站点。');
     const bundle = await readLatestTestBundle(env.MIRROR_BUCKET);
     await configureProject(fetchImpl, token, account, projectPath, bucketName, password);
     const deployment = await uploadPagesBundle(fetchImpl, token, account, project.name, bundle);
@@ -2544,40 +2538,39 @@ let overwrite=false;
 function payload(){return{...credentials(),projectName:byId('project').value.trim(),customDomain:byId('domain').value.trim(),bucketName:byId('bucket').value.trim(),password:byId('password').value,overwrite};}
 byId('token').addEventListener('change',()=>{overwrite=false;});
 byId('project').addEventListener('input',()=>{overwrite=false;});
-form.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;say('正在部署，约需半分钟，请不要关闭页面…');
+form.addEventListener('submit',async(event)=>{event.preventDefault();submit.disabled=true;say('部署中，约需半分钟，请勿关闭页面…');
 try{const result=await post('/api/deploy',payload());
 if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;byId('doneDomain').textContent=result.customDomain?('自定义域名 '+result.customDomain.name+'：'+result.customDomain.message):'';byId('doneDomain').hidden=!result.customDomain;byId('doneName').textContent=result.projectName;form.hidden=true;byId('done').hidden=false;return;}
 if(await askAccount(result))return;
-if(result.code==='PROJECT_EXISTS'){if(await ask(result.error+'\n\n确定继续吗？')){overwrite=true;submit.disabled=false;form.requestSubmit();return;}say('已取消。换个项目名再部署，或确认覆盖。','warn');return;}
+if(result.code==='PROJECT_EXISTS'){if(await ask('覆盖项目',result.error,'覆盖')){overwrite=true;submit.disabled=false;form.requestSubmit();return;}say('已取消，可更换项目名后重新部署。','warn');return;}
 say(result.error||'部署失败','error');}catch(error){say('部署失败：'+error.message,'error');}finally{submit.disabled=false;}});
 `;
 
 const MIGRATE_SCRIPT = DEPLOY_COMMON_SCRIPT + String.raw`
 const form=byId('migrateForm'),submit=byId('migrate'),find=byId('find'),list=byId('sites');
-const KINDS={fork:['魔改版','ok'],test:['已经是测试版','primary'],unknown:['没找到云端数据','warn']};
-function describe(site){if(site.kind==='fork')return '云端最后同步：'+(site.syncedAt?new Date(site.syncedAt).toLocaleString('zh-CN'):'未知');if(site.kind==='test')return '不用迁移，在站点「同步 → 测试版更新」里更新就行';return '可能还没同步过；迁移后各设备只有自己本机的数据';}
-function render(sites){list.innerHTML='';byId('pick').hidden=!sites.length;if(!sites.length){say('这个帐户里没有绑定了存储桶的 Pages 站点。','warn');return;}say('');
+const KINDS={fork:['魔改版','ok'],test:['已是测试版','primary'],unknown:['无云端数据','warn']};
+function describe(site){if(site.kind==='fork')return '上次同步：'+(site.syncedAt?new Date(site.syncedAt).toLocaleString('zh-CN'):'未知');if(site.kind==='test')return '无需迁移，可在站点「云同步 → 测试版更新」中更新';return '迁移后各设备只保留本机数据';}
+function render(sites){list.innerHTML='';byId('pick').hidden=!sites.length;if(!sites.length){say('该帐户中没有绑定存储桶的 Pages 站点。','warn');return;}say('');
 sites.forEach((site)=>{const label=document.createElement('label');label.className='site';const radio=document.createElement('input');radio.type='radio';radio.name='site';radio.value=site.name;radio.disabled=site.kind==='test';const text=document.createElement('span');const name=document.createElement('b');name.textContent=site.name+' ';const badge=document.createElement('span');badge.className='badge '+KINDS[site.kind][1];badge.textContent=KINDS[site.kind][0];const detail=document.createElement('small');detail.textContent=site.url+'　'+describe(site);text.append(name,badge,detail);label.append(radio,text);list.appendChild(label);});
 const forks=sites.filter((site)=>site.kind==='fork');if(forks.length===1)list.querySelector('input[value="'+forks[0].name+'"]').checked=true;}
-find.addEventListener('click',async()=>{if(!byId('token').value.trim()){say('请先填写令牌。','warn');return;}find.disabled=true;say('正在查找…');try{const result=await post('/api/deploy/sites',credentials());if(result.ok){render(result.sites);return;}if(await askAccount(result))return;say(result.error||'查找失败','error');}catch(error){say('查找失败：'+error.message,'error');}finally{find.disabled=false;}});
+find.addEventListener('click',async()=>{if(!byId('token').value.trim()){say('请先填写令牌。','warn');return;}find.disabled=true;say('查找中…');try{const result=await post('/api/deploy/sites',credentials());if(result.ok){render(result.sites);return;}if(await askAccount(result))return;say(result.error||'查找失败','error');}catch(error){say('查找失败：'+error.message,'error');}finally{find.disabled=false;}});
 form.addEventListener('submit',async(event)=>{event.preventDefault();if(byId('pick').hidden){find.click();return;}const site=form.querySelector('input[name="site"]:checked');
 if(!site){say('请先选择要迁移的站点。','warn');return;}if(byId('password').value.length<6){say('同步密码至少 6 位。','warn');return;}
-if(!await ask('把「'+site.value+'」换成测试版？\n\n网址、域名、存储桶都不变，云端数据不会删除。迁移后每台设备在「同步」里点一次「下载」导入数据。'))return;
-submit.disabled=true;say('正在迁移，约需半分钟，请不要关闭页面…');
+if(!await ask('迁移到测试版','「'+site.value+'」将换成最新测试版，网址、域名和存储桶不变，云端数据不会删除。','迁移'))return;
+submit.disabled=true;say('迁移中，约需半分钟，请勿关闭页面…');
 try{const result=await post('/api/deploy/migrate',{...credentials(),projectName:site.value,password:byId('password').value});
 if(result.ok){say('');byId('doneUrl').href=result.url;byId('doneUrl').textContent=result.url;byId('doneVersion').textContent=result.version;form.hidden=true;byId('done').hidden=false;return;}
 if(await askAccount(result))return;say(result.error||'迁移失败','error');}catch(error){say('迁移失败：'+error.message,'error');}finally{submit.disabled=false;}});
 `;
 
-const DEPLOY_TOKEN_FIELDS = `<label class="field">Cloudflare 令牌<small>按「创建令牌」里的说明创建；分发站只在这次操作中使用，不保存。</small><input id="token" type="password" autocomplete="off" required></label>
-<div id="accountField" class="field" hidden><span>用哪个帐户</span><select id="account" hidden></select><div id="accountChoices" class="account-choices"></div><label id="accountManual" class="field" hidden>帐户 ID<small>后台网址 dash.cloudflare.com/ 后面那串 32 位字符</small><input id="accountManualInput" maxlength="32"></label></div>`;
+const DEPLOY_TOKEN_FIELDS = `<label class="field">Cloudflare 令牌<small>按「创建令牌」中的步骤创建，分发站不保存令牌</small><input id="token" type="password" autocomplete="off" required></label>
+<div id="accountField" class="field" hidden><span>选择帐户</span><select id="account" hidden></select><div id="accountChoices" class="account-choices"></div><label id="accountManual" class="field" hidden>帐户 ID<small>Cloudflare 后台网址中 dash.cloudflare.com/ 后面的 32 位字符</small><input id="accountManualInput" maxlength="32"></label></div>`;
 const DEPLOY_TOKEN_STEPS = `<li>打开 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">API 令牌</a> →「创建令牌」→「创建自定义令牌」。</li>
-<li>权限添加三项：<br>帐户 → Cloudflare Pages → 编辑<br>帐户 → Workers R2 存储 → 编辑<br>帐户 → 帐户设置 → 读取</li>`;
-const DEPLOY_TOKEN_USAGE = `<h2>这个令牌会被怎样使用</h2>
+<li>添加以下三项权限：<br>帐户 → Cloudflare Pages → 编辑<br>帐户 → Workers R2 存储 → 编辑<br>帐户 → 帐户设置 → 读取</li>`;
+const DEPLOY_TOKEN_USAGE = `<h2>关于令牌</h2>
 <ul>
-<li>分发站只在这次操作中用它调用 Cloudflare 接口，不保存、不写日志。</li>
-<li>它会作为加密密钥 <code>CF_API_TOKEN</code> 存进你自己的 Pages 项目，站点以后用它一键更新。不想要这个功能，可以在项目设置里删掉它。</li>
-<li>令牌只发给你自己，不要发给别人或贴到群里。</li>
+<li>令牌会保存为你 Pages 项目中的加密变量 <code>CF_API_TOKEN</code>，用于在站内更新测试版；不需要时可在项目设置中删除。</li>
+<li>请勿将令牌发给他人。</li>
 </ul>`;
 const DEPLOY_PAGE_CSS = '.submit-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}.side{position:sticky;top:76px}.side h2{font-size:16px;margin-bottom:8px}.side h2:not(:first-child){margin-top:18px}.side ul,.side ol{margin:0;padding-left:20px;color:var(--muted)}.side li{margin:6px 0}.account-choices{display:grid;gap:8px;margin-top:6px}.account-choices .btn{justify-content:flex-start;text-align:left;overflow-wrap:anywhere}@media(max-width:860px){.submit-layout{grid-template-columns:1fr}.side{position:static}}';
 
@@ -2585,27 +2578,27 @@ function renderDeployHtml() {
     const main = `<div class="submit-layout">
 <section>
 <h1>一键部署</h1>
-<p class="lead">在你自己的 Cloudflare 帐户里创建 RP-Hub 测试版站点：自动建 Pages 项目和 R2 存储桶、绑定、设置同步密码并部署最新测试版。免费计划即可。已经在用魔改版？去 <a href="/migrate">魔改版迁移</a>。</p>
+<p class="lead">在你的 Cloudflare 帐户中创建 Pages 项目和 R2 存储桶，并部署最新测试版，免费计划即可。已在使用魔改版？请前往<a href="/migrate">魔改版迁移</a>。</p>
 <form id="deployForm" class="card pad form" style="margin-top:20px">
 ${DEPLOY_TOKEN_FIELDS}
-<label class="field">项目名<small>会成为网址 <code>项目名.pages.dev</code>；小写字母、数字和短横线；被别人用过会自动加后缀</small><input id="project" maxlength="58" required placeholder="my-rph"></label>
-<label class="field">自定义域名<small>选填，例如 rph.example.com；不填就用 pages.dev 网址</small><input id="domain" maxlength="253" placeholder="rph.example.com"></label>
-<label class="field">存储桶名<small>云同步、图片都存在这里；已有同名桶会直接使用</small><input id="bucket" maxlength="63" required value="rph-data"></label>
-<label class="field">同步密码<small>至少 6 位；以后在站点里同步、管理图片都要用</small><input id="password" type="password" autocomplete="new-password" minlength="6" required></label>
+<label class="field">项目名<small>网址为 <code>项目名.pages.dev</code>；只能包含小写字母、数字和短横线，已被占用时自动加后缀</small><input id="project" maxlength="58" required placeholder="my-rph"></label>
+<label class="field">自定义域名<small>选填，不填则使用 pages.dev 网址</small><input id="domain" maxlength="253" placeholder="rph.example.com"></label>
+<label class="field">R2 存储桶名<small>用于存放云同步数据和图片；已有同名存储桶时直接使用</small><input id="bucket" maxlength="63" required value="rph-data"></label>
+<label class="field">同步密码<small>至少 6 位，在站点中同步和管理图片时使用</small><input id="password" type="password" autocomplete="new-password" minlength="6" required></label>
 <p id="status" class="notice" hidden></p>
 <div class="actions"><button id="deploy" class="btn primary" type="submit">部署</button></div>
 </form>
-<div id="done" class="card pad" hidden style="margin-top:20px"><h2>部署完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>。第一次打开可能要等半分钟生效。</p><p class="notes">项目名：<code id="doneName"></code>（原名被占用时会自动加后缀）。</p><p id="doneDomain" class="notes" hidden></p><p class="notes">之后在站点「同步 → 测试版更新」里就能一键更新，不需要再来这里。</p></div>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>部署完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>，首次打开可能需要等待半分钟。</p><p class="notes">项目名：<code id="doneName"></code></p><p id="doneDomain" class="notes" hidden></p><p class="notes">以后可在站点「云同步 → 测试版更新」中一键更新。</p></div>
 </section>
 <aside class="card pad side">
 <h2>创建令牌</h2>
 <ol>
 ${DEPLOY_TOKEN_STEPS}
-<li>要用自定义域名，再加两项：区域 → 区域 → 读取、区域 → DNS → 编辑（区域资源选你的域名）。不加也能部署，只是要自己去加 DNS 记录。</li>
-<li>帐户资源选你要部署的帐户，创建后复制令牌。</li>
+<li>使用自定义域名时，再添加：区域 → 区域 → 读取、区域 → DNS → 编辑（区域资源选择你的域名）。不添加也能部署，但需要手动添加 DNS 记录。</li>
+<li>帐户资源选择要部署的帐户，创建后复制令牌。</li>
 </ol>
 ${DEPLOY_TOKEN_USAGE}
-<p class="small muted">想手动部署，见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/docs/INSTALL.md">安装说明</a>。</p>
+<p class="small muted">手动部署见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/docs/INSTALL.md">安装说明</a>。</p>
 </aside>
 </div>`;
     return renderShell({ title: '一键部署', active: '/deploy', main, css: DEPLOY_PAGE_CSS, script: DEPLOY_SCRIPT });
@@ -2615,34 +2608,34 @@ function renderMigrateHtml() {
     const main = `<div class="submit-layout">
 <section>
 <h1>从魔改版迁移</h1>
-<p class="lead">已经在用魔改版（cy-2-u/rp）的站点，可以一键换成测试版：网址、自定义域名、存储桶都不变，云端数据不会删除。</p>
+<p class="lead">将魔改版（cy-2-u/rp）站点换成测试版，网址、自定义域名和存储桶不变，云端数据不会删除。</p>
 <form id="migrateForm" class="card pad form" style="margin-top:20px">
 ${DEPLOY_TOKEN_FIELDS}
-<div class="actions"><button id="find" class="btn" type="button">查找我的站点</button></div>
+<div class="actions"><button id="find" class="btn" type="button">查找站点</button></div>
 <div id="pick" class="form" hidden>
-<div class="field"><span>要迁移的站点</span><div id="sites" class="sites"></div></div>
-<label class="field">同步密码<small>填魔改版现在用的密码就行，也可以换个新的（至少 6 位）；换了的话，各设备同步时会让你重新输入</small><input id="password" type="password" autocomplete="new-password"></label>
+<div class="field"><span>选择站点</span><div id="sites" class="sites"></div></div>
+<label class="field">同步密码<small>可沿用魔改版的密码，也可以设置新密码（至少 6 位），更换后各设备同步时需重新输入</small><input id="password" type="password" autocomplete="new-password"></label>
 <div class="actions"><button id="migrate" class="btn primary" type="submit">迁移到测试版</button></div>
 </div>
 <p id="status" class="notice" hidden></p>
 </form>
-<div id="done" class="card pad" hidden style="margin-top:20px"><h2>迁移完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>，第一次打开可能要等半分钟生效。接下来：</p>
-<ol class="notes"><li>每台设备打开站点，在「同步」里点一次「下载」，把魔改版的云端数据导进来，导完页面会自动刷新。</li><li>数据都对了，以后照常「上传」「下载」。第一次上传时还会再提醒一次。</li><li>以后在站点「同步 → 测试版更新」里就能一键更新。</li></ol></div>
+<div id="done" class="card pad" hidden style="margin-top:20px"><h2>迁移完成</h2><p class="notes">测试版 <b id="doneVersion"></b> 已部署到 <a id="doneUrl" target="_blank" rel="noopener"></a>，首次打开可能需要等待半分钟。接下来：</p>
+<ol class="notes"><li>在每台设备上打开站点，在「云同步」中点击「下载」导入魔改版的云端数据，完成后页面会自动刷新。</li><li>确认数据无误后，照常使用「上传」和「下载」。</li><li>以后可在站点「云同步 → 测试版更新」中一键更新。</li></ol></div>
 </section>
 <aside class="card pad side">
 <h2>迁移前</h2>
 <ul>
-<li>先在魔改版里上传一次，让云端是最新的：迁移后各设备导入的是云端的数据。</li>
-<li>在测试版里第一次「上传」之前，随时可以用魔改版的部署器换回去，数据都还在。</li>
+<li>先在魔改版中上传一次，确保云端数据是最新的。</li>
+<li>在测试版中首次「上传」前，可以随时用魔改版的部署器换回，数据不受影响。</li>
 </ul>
-<h2>想反过来换成魔改版</h2>
+<h2>换成魔改版</h2>
 <ul>
-<li>在测试版站点「同步 → 测试版更新」里点「转成魔改版的数据」，再用魔改版自己的一键部署页「更新」这个站点。</li>
+<li>在测试版站点「设置」页最下方的「迁移到魔改版」中点击「转换数据」，再用魔改版的一键部署页更新该站点。</li>
 </ul>
 <h2>创建令牌</h2>
 <ol>
 ${DEPLOY_TOKEN_STEPS}
-<li>帐户资源选站点所在的帐户，创建后复制令牌。和一键部署用的是同一种令牌。</li>
+<li>帐户资源选择站点所在的帐户，创建后复制令牌。</li>
 </ol>
 ${DEPLOY_TOKEN_USAGE}
 </aside>
@@ -2653,9 +2646,9 @@ ${DEPLOY_TOKEN_USAGE}
 
 const SITE_NAV = [['/', '首页'], ['/deploy', '一键部署'], ['/migrate', '魔改版迁移'], ['/workshop/submit', '投稿插件'], ['/admin', '管理']];
 
-// 确认框：代替浏览器的 confirm，返回 Promise<boolean>。
+// 确认框：代替浏览器的 confirm。ask(标题, 正文, 确认按钮文字)，返回 Promise<boolean>。
 const ASK_SCRIPT = String.raw`
-function ask(message){return new Promise((resolve)=>{const dialog=document.createElement('dialog');dialog.className='ask';const text=document.createElement('p');text.textContent=message;const row=document.createElement('div');row.className='actions';const make=(label,cls,value)=>{const button=document.createElement('button');button.type='button';button.className=cls;button.textContent=label;button.addEventListener('click',()=>{dialog.remove();resolve(value);});return button;};row.append(make('取消','btn',false),make('确定','btn primary',true));dialog.append(text,row);dialog.addEventListener('cancel',()=>{dialog.remove();resolve(false);});document.body.appendChild(dialog);dialog.showModal();});}
+function ask(title,message,action){return new Promise((resolve)=>{const dialog=document.createElement('dialog');dialog.className='ask';const head=document.createElement('h2');head.textContent=title;const text=document.createElement('p');text.textContent=message;const row=document.createElement('div');row.className='actions';const make=(label,cls,value)=>{const button=document.createElement('button');button.type='button';button.className=cls;button.textContent=label;button.addEventListener('click',()=>{dialog.remove();resolve(value);});return button;};row.append(make('取消','btn',false),make(action,'btn primary',true));dialog.append(head,text,row);dialog.addEventListener('cancel',()=>{dialog.remove();resolve(false);});document.body.appendChild(dialog);dialog.showModal();});}
 `;
 
 function renderShell({ title, active, main, css = '', script = '' }) {
@@ -2680,50 +2673,54 @@ ${script ? `<script>${ASK_SCRIPT}${script}</script>` : ''}
 </html>`;
 }
 
-// 管理页：概览、上游版本、测试版、插件审核、设置。数据都从现有接口读取，写操作带管理员令牌。
+// 暂不可用版本的原因，首页和管理页共用。
+const PENDING_REASONS = { 'patch-rejected': '暂未适配', 'release-incomplete': '发布内容不完整' };
+
+// 管理页：概览、官方版本、测试版、插件审核、皮肤审核、使用与反馈、设置。数据都从现有接口读取，写操作带管理员令牌。
 const ADMIN_SCRIPT = String.raw`
-const byId=(id)=>document.getElementById(id);const esc=(value)=>String(value??'').replace(/[&<>"']/g,(character)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));const time=(value)=>{if(!(Number(value)>0))return '尚无记录';const parts=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(Number(value)));const get=(type)=>parts.find((part)=>part.type===type)?.value||'';return get('year')+'-'+get('month')+'-'+get('day')+' '+get('hour')+':'+get('minute')};const kb=(bytes)=>Math.max(1,Math.round(Number(bytes||0)/1024))+' KB';
+const reasons=${JSON.stringify(PENDING_REASONS)};
+const byId=(id)=>document.getElementById(id);const esc=(value)=>String(value??'').replace(/[&<>"']/g,(character)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));const time=(value)=>{if(!(Number(value)>0))return '—';const parts=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(Number(value)));const get=(type)=>parts.find((part)=>part.type===type)?.value||'';return get('year')+'-'+get('month')+'-'+get('day')+' '+get('hour')+':'+get('minute')};const kb=(bytes)=>Math.max(1,Math.round(Number(bytes||0)/1024))+' KB';
 const configured=(value)=>value?'<span class="badge ok">已配置</span>':'<span class="badge danger">未配置</span>';const notice=(message,type)=>{const box=byId('notice');box.textContent=message;box.className='notice '+(type||'')};const storedToken=()=>localStorage.getItem('mirrorAdminToken')||'';
-async function api(path,options={}){const headers=new Headers(options.headers||{});const token=storedToken();if(token)headers.set('authorization','Bearer '+token);if(options.body)headers.set('content-type','application/json');const response=await fetch(path,{...options,headers});let value;try{value=await response.json()}catch{value={ok:false,error:'响应不是有效 JSON。'}}if(!response.ok)throw new Error(value.error||('HTTP '+response.status));return value}
+async function api(path,options={}){const headers=new Headers(options.headers||{});const token=storedToken();if(token)headers.set('authorization','Bearer '+token);if(options.body)headers.set('content-type','application/json');const response=await fetch(path,{...options,headers});let value;try{value=await response.json()}catch{value={ok:false,error:'服务器响应异常。'}}if(!response.ok)throw new Error(value.error||('HTTP '+response.status));return value}
 function renderAuth(){const signedIn=Boolean(storedToken());byId('authForm').hidden=signedIn;byId('authState').hidden=!signedIn}
-byId('authForm').addEventListener('submit',(event)=>{event.preventDefault();const token=byId('adminToken').value.trim();if(!token)return;localStorage.setItem('mirrorAdminToken',token);byId('adminToken').value='';renderAuth();notice('管理员令牌已保存到此浏览器。','ok');refreshWorkshop();refreshSkins()});
-byId('logout').addEventListener('click',()=>{localStorage.removeItem('mirrorAdminToken');renderAuth();notice('已退出，令牌已从此浏览器删除。')});
+byId('authForm').addEventListener('submit',(event)=>{event.preventDefault();const token=byId('adminToken').value.trim();if(!token)return;localStorage.setItem('mirrorAdminToken',token);byId('adminToken').value='';renderAuth();notice('令牌已保存。','ok');refreshWorkshop();refreshSkins()});
+byId('logout').addEventListener('click',()=>{localStorage.removeItem('mirrorAdminToken');renderAuth();notice('已退出。')});
 function showTab(name){if(!document.querySelector('[data-panel="'+name+'"]'))name='overview';document.querySelectorAll('[data-tab]').forEach((button)=>button.setAttribute('aria-selected',String(button.dataset.tab===name)));document.querySelector('[data-tab="'+name+'"]').scrollIntoView({block:'nearest',inline:'nearest'});document.querySelectorAll('[data-panel]').forEach((panel)=>{panel.hidden=panel.dataset.panel!==name});history.replaceState(null,'','#'+name);if(name==='tests')refreshTests();if(name==='workshop')refreshWorkshop();if(name==='skins')refreshSkins();if(name==='feedback')refreshFeedback()}
 document.querySelectorAll('[data-tab]').forEach((button)=>button.addEventListener('click',()=>showTab(button.dataset.tab)));window.addEventListener('hashchange',()=>showTab(location.hash.slice(1)));
-function versionItems(versions){return versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>commit <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>收录 '+esc(time(item.publishedAt))+'</span><span>'+Number(item.fileCount||0)+' 个文件</span></div></div><div class="actions"><button class="btn small show-announcement" data-tag="'+esc(item.tag)+'">公告</button><button class="btn small danger delete-version" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">删除</button></div></li>').join(''):'<li class="empty">尚无已发布版本</li>'}
-function pendingItems(pending){return pending.length?pending.map((item)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> <span class="badge warn">'+esc(item.reason)+'</span><div class="meta"><span>commit <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>发现 '+esc(time(item.seenAt))+'</span></div><div class="notes small muted">'+esc(item.detail)+'</div></div><button class="btn small retry" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">重试</button></li>').join(''):'<li class="empty">没有挂起的版本</li>'}
-function bindRetry(){document.querySelectorAll('.retry').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;notice('正在重试 '+button.dataset.tag+'…');try{const result=await api('/api/pending/retry',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice(result.sync?.ok?'重试完成。':'重试已执行，同步仍有错误。',result.sync?.ok?'ok':'error');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}}))}
-function bindDelete(){document.querySelectorAll('.delete-version').forEach((button)=>button.addEventListener('click',async()=>{if(!await ask('确认删除版本 '+button.dataset.tag+'？快照文件一并清理；如果它仍是上游现行 Release，下次同步会重新上架。'))return;button.disabled=true;notice('正在删除 '+button.dataset.tag+'…');try{const result=await api('/api/versions/delete',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice('已删除 '+button.dataset.tag+'（清理快照 '+(result.snapshotsDeleted||0)+' 个）。','ok');await refresh()}catch(error){notice(error.message,'error');button.disabled=false}}))}
-function bindAnnouncements(){document.querySelectorAll('.show-announcement').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;const panel=byId('announcementPanel');panel.textContent='公告加载中…';panel.hidden=false;try{const response=await fetch('/announcements.json?tag='+encodeURIComponent(button.dataset.tag));let value=null;try{value=await response.json()}catch{value=null}panel.textContent='';const head=document.createElement('h3');head.textContent='公告 · '+button.dataset.tag;panel.appendChild(head);if(!response.ok||!value){const message=document.createElement('p');message.textContent=response.status===404?'公告索引尚未生成，请先点一次「同步上游版本」。':'公告加载失败：HTTP '+response.status;panel.appendChild(message)}else{const entry=(Array.isArray(value.entries)?value.entries:[]).find((item)=>item&&item.tag===button.dataset.tag)||null;const body=document.createElement(entry&&entry.announcement?'pre':'p');body.textContent=entry&&entry.announcement?'[ID '+entry.announcement.id+'] '+entry.announcement.title+'\n\n'+entry.announcement.content:'该版本暂无公告'+(entry&&entry.reason?'（'+entry.reason+'）。':'。');panel.appendChild(body)}panel.scrollIntoView({block:'nearest'})}catch(error){panel.textContent='公告加载失败：'+error.message}finally{button.disabled=false}}))}
-function render(status){byId('pageStamp').textContent='状态时间 '+time(Date.now());byId('manifestState').textContent=status.manifest.valid?'正常':'格式无效';byId('updatedAt').textContent=time(status.manifest.updatedAt);byId('counts').textContent=status.manifest.versions.length+' / '+status.manifest.pending.length;const error=status.syncError;byId('syncError').textContent=error?((error.valid?'有同步错误':'错误状态无效')+' · '+time(error.at)):'无';const detail=error&&error.detail?((error.tag?'['+error.tag+'] ':'')+error.detail):'';byId('syncErrorDetail').textContent=detail;byId('syncErrorDetail').hidden=!detail;const progress=status.syncProgress;const box=byId('syncProgress');box.textContent='同步进度：'+(progress?((progress.state==='running'?'进行中':(progress.state==='done'?'已完成':'出错'))+' · 第 '+progress.step+' 步：'+progress.phase+(progress.detail?' — '+progress.detail:'')+' · '+time(progress.at)):'尚未同步过');box.className='notice '+(progress?(progress.state==='running'?'':(progress.state==='done'?'ok':'error')):'');byId('releaseLimit').value=status.config.releaseLimit;byId('webhookEnabled').checked=status.config.webhookEnabled;byId('upstreamRepo').textContent=status.config.upstreamRepo;byId('patchRevision').textContent=status.RP_HUB_APP_PATCH_REVISION;byId('secretGithub').innerHTML=configured(status.secrets.github);byId('secretWebhook').innerHTML=configured(status.secrets.webhook);byId('secretWebhookAuth').innerHTML=configured(status.secrets.webhookAuth);byId('secretAdmin').innerHTML=configured(status.secrets.admin);byId('versionsBody').innerHTML=versionItems(status.manifest.versions);byId('pendingBody').innerHTML=pendingItems(status.manifest.pending);byId('pendingCount').textContent=status.manifest.pending.length?String(status.manifest.pending.length):'';bindRetry();bindDelete();byId('announcementPanel').hidden=true;bindAnnouncements()}
+function versionItems(versions){return versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>提交 <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>收录于 '+esc(time(item.publishedAt))+'</span><span>'+Number(item.fileCount||0)+' 个文件</span></div></div><div class="actions"><button class="btn small show-announcement" data-tag="'+esc(item.tag)+'">查看公告</button><button class="btn small danger delete-version" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">删除</button></div></li>').join(''):'<li class="empty">暂无版本</li>'}
+function pendingItems(pending){return pending.length?pending.map((item)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> <span class="badge warn">'+esc(reasons[item.reason]||item.reason)+'</span><div class="meta"><span>提交 <code>'+esc(String(item.commit).slice(0,12))+'</code></span><span>发现于 '+esc(time(item.seenAt))+'</span></div><div class="notes small muted">'+esc(item.detail)+'</div></div><button class="btn small retry" data-tag="'+esc(item.tag)+'" data-commit="'+esc(item.commit)+'">重试</button></li>').join(''):'<li class="empty">暂无</li>'}
+function bindRetry(){document.querySelectorAll('.retry').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;notice('重试中…');try{const result=await api('/api/pending/retry',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice(result.sync?.ok?'重试完成。':'重试后同步仍有错误。',result.sync?.ok?'ok':'error');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}}))}
+function bindDelete(){document.querySelectorAll('.delete-version').forEach((button)=>button.addEventListener('click',async()=>{if(!await ask('删除版本 '+button.dataset.tag,'如果官方仍提供这个版本，下次同步会重新收录。','删除'))return;button.disabled=true;notice('删除中…');try{await api('/api/versions/delete',{method:'POST',body:JSON.stringify({tag:button.dataset.tag,commit:button.dataset.commit})});notice('已删除 '+button.dataset.tag+'。','ok');await refresh()}catch(error){notice(error.message,'error');button.disabled=false}}))}
+function bindAnnouncements(){document.querySelectorAll('.show-announcement').forEach((button)=>button.addEventListener('click',async()=>{button.disabled=true;const panel=byId('announcementPanel');panel.textContent='加载中…';panel.hidden=false;try{const response=await fetch('/announcements.json?tag='+encodeURIComponent(button.dataset.tag));let value=null;try{value=await response.json()}catch{value=null}panel.textContent='';const head=document.createElement('h3');head.textContent='公告 · '+button.dataset.tag;panel.appendChild(head);if(!response.ok||!value){const message=document.createElement('p');message.textContent=response.status===404?'暂无公告数据，请先同步官方版本。':'公告加载失败：HTTP '+response.status;panel.appendChild(message)}else{const entry=(Array.isArray(value.entries)?value.entries:[]).find((item)=>item&&item.tag===button.dataset.tag)||null;const body=document.createElement(entry&&entry.announcement?'pre':'p');body.textContent=entry&&entry.announcement?entry.announcement.title+'\n\n'+entry.announcement.content:(entry&&entry.reason==='parse-failed'?'公告读取失败。':'该版本暂无公告。');panel.appendChild(body)}panel.scrollIntoView({block:'nearest'})}catch(error){panel.textContent='公告加载失败：'+error.message}finally{button.disabled=false}}))}
+function render(status){byId('pageStamp').textContent='刷新于 '+time(Date.now());byId('manifestState').textContent=status.manifest.valid?'正常':'格式无效';byId('updatedAt').textContent=time(status.manifest.updatedAt);byId('counts').textContent=status.manifest.versions.length+' / '+status.manifest.pending.length;const error=status.syncError;byId('syncError').textContent=error?(error.valid?time(error.at):'记录无效'):'无';const detail=error&&error.detail?((error.tag?'['+error.tag+'] ':'')+error.detail):'';byId('syncErrorDetail').textContent=detail;byId('syncErrorDetail').hidden=!detail;const progress=status.syncProgress;const box=byId('syncProgress');box.textContent='同步进度：'+(progress?((progress.state==='running'?'进行中':(progress.state==='done'?'已完成':'失败'))+' · 第 '+progress.step+' 步：'+progress.phase+(progress.detail?' — '+progress.detail:'')+' · '+time(progress.at)):'暂无记录');box.className='notice '+(progress?(progress.state==='running'?'':(progress.state==='done'?'ok':'error')):'');byId('releaseLimit').value=status.config.releaseLimit;byId('webhookEnabled').checked=status.config.webhookEnabled;byId('upstreamRepo').textContent=status.config.upstreamRepo;byId('patchRevision').textContent=status.RP_HUB_APP_PATCH_REVISION;byId('secretGithub').innerHTML=configured(status.secrets.github);byId('secretWebhook').innerHTML=configured(status.secrets.webhook);byId('secretWebhookAuth').innerHTML=configured(status.secrets.webhookAuth);byId('secretAdmin').innerHTML=configured(status.secrets.admin);byId('versionsBody').innerHTML=versionItems(status.manifest.versions);byId('pendingBody').innerHTML=pendingItems(status.manifest.pending);byId('pendingCount').textContent=status.manifest.pending.length?String(status.manifest.pending.length):'';bindRetry();bindDelete();byId('announcementPanel').hidden=true;bindAnnouncements()}
 let progressTimer=null;function startProgressPolling(){if(progressTimer)return;progressTimer=setInterval(async()=>{try{const status=await api('/api/status');render(status);if(!status.syncProgress||status.syncProgress.state!=='running'){clearInterval(progressTimer);progressTimer=null}}catch{}},2000)}
-function syncSummary(result){const parts=[];const published=(result.events||[]).filter((event)=>event==='version_published'||event==='retag_republished').length;const failed=(result.events||[]).filter((event)=>event.indexOf('precheck_failed')>=0).length;if(published)parts.push('上架 '+published+' 个上游版本');if(failed)parts.push(failed+' 个预检失败转挂起');if(!published&&!failed)parts.push(result.changed?'状态已更新':'上游无新版本');parts.push('累计 '+result.versionCount+' 个');if(result.snapshotBudget&&result.snapshotBudget.deferred)parts.push('还有版本待回填，请再点一次「同步上游版本」');return parts.join('；')+'。'}
+function syncSummary(result){const parts=[];const published=(result.events||[]).filter((event)=>event==='version_published'||event==='retag_republished').length;const failed=(result.events||[]).filter((event)=>event.indexOf('precheck_failed')>=0).length;if(published)parts.push('收录 '+published+' 个版本');if(failed)parts.push(failed+' 个版本暂不可用');if(!published&&!failed)parts.push(result.changed?'状态已更新':'没有新版本');parts.push('共 '+result.versionCount+' 个');if(result.snapshotBudget&&result.snapshotBudget.deferred)parts.push('还有版本未收录，请再次同步');return parts.join('；')+'。'}
 async function refresh(){try{render(await api('/api/status'))}catch(error){notice(error.message,'error')}}
-byId('refresh').addEventListener('click',async()=>{await refresh();notice('状态已刷新。','ok')});
-byId('syncNow').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('正在同步…（进度每 2 秒刷新）');startProgressPolling();try{const result=await api('/api/sync',{method:'POST'});notice(result.ok?'同步完成：'+syncSummary(result):'同步失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refresh()}catch(error){notice('同步失败：'+error.message,'error')}finally{button.disabled=false}});
-byId('syncTests').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('正在同步测试版…');try{const result=await api('/api/sync/test-releases',{method:'POST'});notice(result.ok?'测试版同步完成：共 '+result.versionCount+' 个。':'测试版同步失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refreshTests()}catch(error){notice('测试版同步失败：'+error.message,'error')}finally{button.disabled=false}});
-byId('webhookTest').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('正在测试 Webhook…');try{const result=await api('/api/webhook-test',{method:'POST'});notice(result.sent?'Webhook 已发送。':(result.disabled?'Webhook 已禁用。':'Webhook 未发送。'),result.sent?'ok':'error')}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
-byId('configForm').addEventListener('submit',async(event)=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{await api('/api/config',{method:'PUT',body:JSON.stringify({releaseLimit:Number(byId('releaseLimit').value),webhookEnabled:byId('webhookEnabled').checked})});notice('配置已保存。','ok');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
-async function refreshTests(){const box=byId('testsBody');try{const response=await fetch('/test-releases/manifest.json',{cache:'no-store'});if(response.status===404){box.innerHTML='<li class="empty">还没有测试版</li>';return}const value=await response.json();const versions=value.versions||[];box.innerHTML=versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>发布 '+esc(time(item.publishedAt))+'</span><span>发布包 '+kb(item.bundle&&item.bundle.size)+'</span>'+(item.zip?'<span>部署包 '+kb(item.zip.size)+'</span>':'')+'</div><p class="notes small">'+esc(item.notes||'无更新说明')+'</p></div>'+(item.zip?'<a class="btn small" href="'+esc(item.zip.path)+'">部署包</a>':'')+'</li>').join(''):'<li class="empty">还没有测试版</li>'}catch(error){box.innerHTML='<li class="empty">读取失败：'+esc(error.message)+'</li>'}}
+byId('refresh').addEventListener('click',async()=>{await refresh();notice('已刷新。','ok')});
+byId('syncNow').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('同步中…');startProgressPolling();try{const result=await api('/api/sync',{method:'POST'});notice(result.ok?'同步完成：'+syncSummary(result):'同步失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refresh()}catch(error){notice('同步失败：'+error.message,'error')}finally{button.disabled=false}});
+byId('syncTests').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('同步中…');try{const result=await api('/api/sync/test-releases',{method:'POST'});notice(result.ok?'同步完成，共 '+result.versionCount+' 个测试版。':'同步失败：'+(result.error||'未知错误'),result.ok?'ok':'error');await refreshTests()}catch(error){notice('同步失败：'+error.message,'error')}finally{button.disabled=false}});
+byId('webhookTest').addEventListener('click',async(event)=>{const button=event.currentTarget;button.disabled=true;notice('发送中…');try{const result=await api('/api/webhook-test',{method:'POST'});notice(result.sent?'测试通知已发送。':(result.disabled?'Webhook 通知已关闭。':'发送失败。'),result.sent?'ok':'error')}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
+byId('configForm').addEventListener('submit',async(event)=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{await api('/api/config',{method:'PUT',body:JSON.stringify({releaseLimit:Number(byId('releaseLimit').value),webhookEnabled:byId('webhookEnabled').checked})});notice('已保存。','ok');await refresh()}catch(error){notice(error.message,'error')}finally{button.disabled=false}});
+async function refreshTests(){const box=byId('testsBody');try{const response=await fetch('/test-releases/manifest.json',{cache:'no-store'});if(response.status===404){box.innerHTML='<li class="empty">暂无测试版</li>';return}const value=await response.json();const versions=value.versions||[];box.innerHTML=versions.length?versions.map((item,index)=>'<li><div class="grow"><b>'+esc(item.tag)+'</b> '+(index===0?'<span class="badge primary">最新</span>':'')+'<div class="meta"><span>发布于 '+esc(time(item.publishedAt))+'</span><span>更新包 '+kb(item.bundle&&item.bundle.size)+'</span>'+(item.zip?'<span>部署包 '+kb(item.zip.size)+'</span>':'')+'</div><p class="notes small">'+esc(item.notes||'暂无更新说明')+'</p></div>'+(item.zip?'<a class="btn small" href="'+esc(item.zip.path)+'">下载部署包</a>':'')+'</li>').join(''):'<li class="empty">暂无测试版</li>'}catch(error){box.innerHTML='<li class="empty">加载失败：'+esc(error.message)+'</li>'}}
 let workshop={pending:[],plugins:[]};let review=null;
-async function refreshWorkshop(){if(!storedToken()){byId('workshopPendingBody').innerHTML='<li class="empty">保存管理员令牌后才能查看投稿</li>';byId('workshopPluginsBody').innerHTML='';return}try{workshop=await api('/api/workshop/pending');renderWorkshop()}catch(error){notice(error.message,'error')}}
-function renderWorkshop(){byId('workshopCount').textContent=workshop.pending.length?String(workshop.pending.length):'';byId('workshopPendingBody').innerHTML=workshop.pending.length?workshop.pending.map((item)=>{const current=workshop.plugins.find((plugin)=>plugin.id===item.id);return '<li><div class="grow"><b>'+esc(item.name)+'</b> <code>'+esc(item.id)+'</code> '+(current?'<span class="badge warn">更新 '+esc(current.version)+' → '+esc(item.version)+'</span>':'<span class="badge ok">新插件 '+esc(item.version)+'</span>')+'<div class="meta"><span>'+esc(item.author)+'</span><span>投稿 '+esc(time(item.submittedAt))+'</span><span>'+kb(item.size)+'</span><span>API '+esc(item.requiresApi)+'</span>'+(item.contact?'<span>联系 '+esc(item.contact)+'</span>':'')+'</div><p class="notes small">'+esc(item.description)+'</p></div><button class="btn small primary ws-review" data-sid="'+esc(item.sid)+'">审阅</button></li>'}).join(''):'<li class="empty">没有待审核的投稿</li>';byId('workshopPluginsBody').innerHTML=workshop.plugins.length?workshop.plugins.map((plugin)=>'<li><div class="grow"><b>'+esc(plugin.name)+'</b> <code>'+esc(plugin.id)+'</code> <span class="badge">v'+esc(plugin.version)+'</span><div class="meta"><span>'+esc(plugin.author)+'</span><span>更新 '+esc(time(plugin.updatedAt))+'</span><span>'+kb(plugin.file&&plugin.file.size)+'</span></div></div><div class="actions"><a class="btn small" href="'+esc(plugin.file.path)+'" target="_blank" rel="noopener">源码</a><button class="btn small danger ws-remove" data-id="'+esc(plugin.id)+'">下架</button></div></li>').join(''):'<li class="empty">工坊里还没有插件</li>';document.querySelectorAll('.ws-review').forEach((button)=>button.addEventListener('click',()=>openReview(button.dataset.sid).catch((error)=>notice(error.message,'error'))));document.querySelectorAll('.ws-remove').forEach((button)=>button.addEventListener('click',async()=>{if(!await ask('确认下架 '+button.dataset.id+'？已经装了的站点不受影响，但工坊里不再显示。'))return;button.disabled=true;try{await api('/api/workshop/remove',{method:'POST',body:JSON.stringify({id:button.dataset.id})});notice('已下架 '+button.dataset.id+'。','ok');await refreshWorkshop()}catch(error){notice(error.message,'error');button.disabled=false}}))}
-async function openReview(sid){const item=workshop.pending.find((entry)=>entry.sid===sid);if(!item)return;const current=workshop.plugins.find((plugin)=>plugin.id===item.id)||null;notice('正在读取投稿代码…');const response=await fetch('/api/workshop/pending/'+sid+'.js',{headers:{authorization:'Bearer '+storedToken()}});if(!response.ok)throw new Error('读取投稿代码失败：HTTP '+response.status);const text=await response.text();let old=null;if(current){const published=await fetch(current.file.path,{cache:'no-store'});if(published.ok)old=await published.text()}review={item,current,text,old};byId('reviewTitle').textContent=item.name+' · '+item.id+' v'+item.version;byId('reviewMeta').innerHTML='<span>作者 '+esc(item.author)+'</span><span>'+kb(item.size)+'</span><span>API '+esc(item.requiresApi)+'</span><span>SHA-256 <code>'+esc(String(item.sha256).slice(0,16))+'…</code></span>'+(item.contact?'<span>联系 '+esc(item.contact)+'</span>':'')+(current?'<span>当前上架 v'+esc(current.version)+'（'+esc(current.author)+'）</span>':'<span>新插件</span>');byId('reviewDescription').textContent=item.description;byId('viewDiff').hidden=!old;showCode(old?'diff':'full');byId('reviewPanel').hidden=false;byId('reviewPanel').scrollIntoView({block:'start'});notice('请读完代码再决定上架或拒绝。')}
+async function refreshWorkshop(){if(!storedToken()){byId('workshopPendingBody').innerHTML='<li class="empty">请先保存管理员令牌</li>';byId('workshopPluginsBody').innerHTML='';return}try{workshop=await api('/api/workshop/pending');renderWorkshop()}catch(error){notice(error.message,'error')}}
+function renderWorkshop(){byId('workshopCount').textContent=workshop.pending.length?String(workshop.pending.length):'';byId('workshopPendingBody').innerHTML=workshop.pending.length?workshop.pending.map((item)=>{const current=workshop.plugins.find((plugin)=>plugin.id===item.id);return '<li><div class="grow"><b>'+esc(item.name)+'</b> <code>'+esc(item.id)+'</code> '+(current?'<span class="badge warn">更新 '+esc(current.version)+' → '+esc(item.version)+'</span>':'<span class="badge ok">新插件 '+esc(item.version)+'</span>')+'<div class="meta"><span>'+esc(item.author)+'</span><span>投稿于 '+esc(time(item.submittedAt))+'</span><span>'+kb(item.size)+'</span><span>API '+esc(item.requiresApi)+'</span>'+(item.contact?'<span>联系方式：'+esc(item.contact)+'</span>':'')+'</div><p class="notes small">'+esc(item.description)+'</p></div><button class="btn small primary ws-review" data-sid="'+esc(item.sid)+'">审核</button></li>'}).join(''):'<li class="empty">暂无待审核投稿</li>';byId('workshopPluginsBody').innerHTML=workshop.plugins.length?workshop.plugins.map((plugin)=>'<li><div class="grow"><b>'+esc(plugin.name)+'</b> <code>'+esc(plugin.id)+'</code> <span class="badge">v'+esc(plugin.version)+'</span><div class="meta"><span>'+esc(plugin.author)+'</span><span>更新于 '+esc(time(plugin.updatedAt))+'</span><span>'+kb(plugin.file&&plugin.file.size)+'</span></div></div><div class="actions"><a class="btn small" href="'+esc(plugin.file.path)+'" target="_blank" rel="noopener">查看源码</a><button class="btn small danger ws-remove" data-id="'+esc(plugin.id)+'">下架</button></div></li>').join(''):'<li class="empty">暂无插件</li>';document.querySelectorAll('.ws-review').forEach((button)=>button.addEventListener('click',()=>openReview(button.dataset.sid).catch((error)=>notice(error.message,'error'))));document.querySelectorAll('.ws-remove').forEach((button)=>button.addEventListener('click',async()=>{if(!await ask('下架插件','下架后工坊中不再显示 '+button.dataset.id+'，已安装的站点不受影响。','下架'))return;button.disabled=true;try{await api('/api/workshop/remove',{method:'POST',body:JSON.stringify({id:button.dataset.id})});notice('已下架 '+button.dataset.id+'。','ok');await refreshWorkshop()}catch(error){notice(error.message,'error');button.disabled=false}}))}
+async function openReview(sid){const item=workshop.pending.find((entry)=>entry.sid===sid);if(!item)return;const current=workshop.plugins.find((plugin)=>plugin.id===item.id)||null;notice('加载中…');const response=await fetch('/api/workshop/pending/'+sid+'.js',{headers:{authorization:'Bearer '+storedToken()}});if(!response.ok)throw new Error('加载失败：HTTP '+response.status);const text=await response.text();let old=null;if(current){const published=await fetch(current.file.path,{cache:'no-store'});if(published.ok)old=await published.text()}review={item,current,text,old};byId('reviewTitle').textContent=item.name+' · '+item.id+' v'+item.version;byId('reviewMeta').innerHTML='<span>作者 '+esc(item.author)+'</span><span>'+kb(item.size)+'</span><span>API '+esc(item.requiresApi)+'</span>'+(item.contact?'<span>联系方式：'+esc(item.contact)+'</span>':'')+(current?'<span>已上架 v'+esc(current.version)+'（'+esc(current.author)+'）</span>':'<span>新插件</span>');byId('reviewDescription').textContent=item.description;byId('viewDiff').hidden=!old;showCode(old?'diff':'full');byId('reviewPanel').hidden=false;byId('reviewPanel').scrollIntoView({block:'start'});notice('就绪')}
 function showCode(mode){byId('viewDiff').setAttribute('aria-selected',String(mode==='diff'));byId('viewFull').setAttribute('aria-selected',String(mode==='full'));byId('reviewCode').innerHTML=mode==='diff'?renderDiff(review.old,review.text):renderFull(review.text)}
 byId('viewDiff').addEventListener('click',()=>showCode('diff'));byId('viewFull').addEventListener('click',()=>showCode('full'));
 function renderFull(text){return text.split('\n').map((line,index)=>'<div class="ln"><span>'+(index+1)+'</span><code>'+esc(line)+'</code></div>').join('')}
 function diffLines(a,b){let start=0;while(start<a.length&&start<b.length&&a[start]===b[start])start++;let endA=a.length,endB=b.length;while(endA>start&&endB>start&&a[endA-1]===b[endB-1]){endA--;endB--}const ops=[];for(let i=0;i<start;i++)ops.push(['=',a[i],i+1,i+1]);const x=a.slice(start,endA),y=b.slice(start,endB);if(x.length*y.length<=4000000){const n=x.length,m=y.length,w=m+1,dp=new Uint32Array((n+1)*w);for(let i=n-1;i>=0;i--)for(let j=m-1;j>=0;j--)dp[i*w+j]=x[i]===y[j]?dp[(i+1)*w+j+1]+1:Math.max(dp[(i+1)*w+j],dp[i*w+j+1]);let i=0,j=0;while(i<n||j<m){if(i<n&&j<m&&x[i]===y[j]){ops.push(['=',x[i],start+i+1,start+j+1]);i++;j++}else if(j<m&&(i>=n||dp[i*w+j+1]>dp[(i+1)*w+j])){ops.push(['+',y[j],0,start+j+1]);j++}else{ops.push(['-',x[i],start+i+1,0]);i++}}}else{x.forEach((line,k)=>ops.push(['-',line,start+k+1,0]));y.forEach((line,k)=>ops.push(['+',line,0,start+k+1]))}for(let k=0;k<a.length-endA;k++)ops.push(['=',a[endA+k],endA+k+1,endB+k+1]);return ops}
-function renderDiff(oldText,newText){const ops=diffLines(oldText.split('\n'),newText.split('\n'));const keep=new Uint8Array(ops.length);let added=0,removed=0;ops.forEach((op,index)=>{if(op[0]==='+')added++;if(op[0]==='-')removed++;if(op[0]!=='=')for(let d=-3;d<=3;d++)if(index+d>=0&&index+d<ops.length)keep[index+d]=1});if(!added&&!removed)return '<div class="empty">代码和已上架版本完全相同</div>';let html='<div class="diff-sum"><span class="badge ok">+'+added+' 行</span> <span class="badge danger">-'+removed+' 行</span> <span class="muted small">只显示改动和前后 3 行</span></div>',skipped=0;const gap=()=>{if(skipped)html+='<div class="ln gap"><span></span><code>… 省略 '+skipped+' 行未改动 …</code></div>';skipped=0};ops.forEach((op,index)=>{if(!keep[index]){skipped++;return}gap();html+='<div class="ln'+(op[0]==='+'?' add':op[0]==='-'?' del':'')+'"><span>'+(op[0]==='-'?op[2]:op[3])+'</span><code>'+(op[0]==='='?' ':op[0])+' '+esc(op[1])+'</code></div>'});gap();return html}
-async function decide(action){if(!review)return;const label=action==='approve'?'上架':'拒绝';if(!await ask(action==='approve'?'确认上架？插件会拥有安装它的站点的全部权限。':'确认拒绝这条投稿？投稿文件会被删除。'))return;try{const result=await api('/api/workshop/'+action,{method:'POST',body:JSON.stringify({sid:review.item.sid})});byId('reviewPanel').hidden=true;review=null;await refreshWorkshop();notice(action==='approve'?'已上架 '+result.published.id+' v'+result.published.version+'。':'已'+label+'。','ok')}catch(error){notice(label+'失败：'+error.message,'error')}}
-byId('reviewApprove').addEventListener('click',()=>decide('approve'));byId('reviewReject').addEventListener('click',()=>decide('reject'));byId('reviewClose').addEventListener('click',()=>{byId('reviewPanel').hidden=true});byId('workshopRefresh').addEventListener('click',async()=>{await refreshWorkshop();notice('工坊已刷新。','ok')});
+function renderDiff(oldText,newText){const ops=diffLines(oldText.split('\n'),newText.split('\n'));const keep=new Uint8Array(ops.length);let added=0,removed=0;ops.forEach((op,index)=>{if(op[0]==='+')added++;if(op[0]==='-')removed++;if(op[0]!=='=')for(let d=-3;d<=3;d++)if(index+d>=0&&index+d<ops.length)keep[index+d]=1});if(!added&&!removed)return '<div class="empty">与已上架版本相同</div>';let html='<div class="diff-sum"><span class="badge ok">+'+added+' 行</span> <span class="badge danger">-'+removed+' 行</span></div>',skipped=0;const gap=()=>{if(skipped)html+='<div class="ln gap"><span></span><code>… '+skipped+' 行未改动 …</code></div>';skipped=0};ops.forEach((op,index)=>{if(!keep[index]){skipped++;return}gap();html+='<div class="ln'+(op[0]==='+'?' add':op[0]==='-'?' del':'')+'"><span>'+(op[0]==='-'?op[2]:op[3])+'</span><code>'+(op[0]==='='?' ':op[0])+' '+esc(op[1])+'</code></div>'});gap();return html}
+async function decide(action){if(!review)return;const label=action==='approve'?'上架':'拒绝';if(!await ask(action==='approve'?'上架插件':'拒绝投稿',action==='approve'?'插件将拥有安装它的站点的全部权限。':'投稿文件将被删除。',label))return;try{const result=await api('/api/workshop/'+action,{method:'POST',body:JSON.stringify({sid:review.item.sid})});byId('reviewPanel').hidden=true;review=null;await refreshWorkshop();notice(action==='approve'?'已上架 '+result.published.id+' v'+result.published.version+'。':'已'+label+'。','ok')}catch(error){notice(label+'失败：'+error.message,'error')}}
+byId('reviewApprove').addEventListener('click',()=>decide('approve'));byId('reviewReject').addEventListener('click',()=>decide('reject'));byId('reviewClose').addEventListener('click',()=>{byId('reviewPanel').hidden=true});byId('workshopRefresh').addEventListener('click',async()=>{await refreshWorkshop();notice('已刷新。','ok')});
 let skinState={pending:[],skins:[]};let skinReview=null;
-async function refreshSkins(){if(!storedToken()){byId('skinPendingBody').innerHTML='<li class="empty">保存管理员令牌后才能查看投稿</li>';byId('skinListBody').innerHTML='';return}try{skinState=await api('/api/workshop/skins/pending');renderSkins()}catch(error){notice(error.message,'error')}}
-function renderSkins(){byId('skinCount').textContent=skinState.pending.length?String(skinState.pending.length):'';byId('skinPendingBody').innerHTML=skinState.pending.length?skinState.pending.map((item)=>{const current=skinState.skins.find((skin)=>skin.id===item.id);return '<li><div class="grow"><b>'+esc(item.name)+'</b> <code>'+esc(item.id)+'</code> '+(current?'<span class="badge warn">更新 '+esc(current.version)+' → '+esc(item.version)+'</span>':'<span class="badge ok">新皮肤 '+esc(item.version)+'</span>')+'<div class="meta">'+(item.note?'<span>'+esc(item.note)+'</span>':'')+'<span>'+esc(item.author)+'</span><span>投稿 '+esc(time(item.submittedAt))+'</span><span>'+kb(item.size)+'</span>'+(item.contact?'<span>联系 '+esc(item.contact)+'</span>':'')+'</div>'+(item.description?'<p class="notes small">'+esc(item.description)+'</p>':'')+'</div><button class="btn small primary skin-review" data-sid="'+esc(item.sid)+'">查看</button></li>'}).join(''):'<li class="empty">没有待审核的皮肤</li>';byId('skinListBody').innerHTML=skinState.skins.length?skinState.skins.map((skin)=>'<li><img class="skin-cover" src="'+esc(skin.cover.path)+'" alt=""><div class="grow"><b>'+esc(skin.name)+'</b> <code>'+esc(skin.id)+'</code> <span class="badge">v'+esc(skin.version)+'</span><div class="meta">'+(skin.note?'<span>'+esc(skin.note)+'</span>':'')+'<span>'+esc(skin.author)+'</span><span>更新 '+esc(time(skin.updatedAt))+'</span><span>'+kb(skin.file&&skin.file.size)+'</span></div></div><button class="btn small danger skin-remove" data-id="'+esc(skin.id)+'">下架</button></li>').join(''):'<li class="empty">皮肤工坊里还没有皮肤</li>';document.querySelectorAll('.skin-review').forEach((button)=>button.addEventListener('click',()=>openSkinReview(button.dataset.sid).catch((error)=>notice(error.message,'error'))));document.querySelectorAll('.skin-remove').forEach((button)=>button.addEventListener('click',async()=>{if(!await ask('确认下架 '+button.dataset.id+'？已经下载了的站点不受影响，但皮肤工坊里不再显示。'))return;button.disabled=true;try{await api('/api/workshop/skins/remove',{method:'POST',body:JSON.stringify({id:button.dataset.id})});notice('已下架 '+button.dataset.id+'。','ok');await refreshSkins()}catch(error){notice(error.message,'error');button.disabled=false}}))}
-async function openSkinReview(sid){const item=skinState.pending.find((entry)=>entry.sid===sid);if(!item)return;notice('正在读取皮肤包…');const response=await fetch('/api/workshop/skins/pending/'+sid+'.json',{headers:{authorization:'Bearer '+storedToken()}});if(!response.ok)throw new Error('读取皮肤包失败：HTTP '+response.status);const skin=await response.json();skinReview=item;byId('skinReviewTitle').textContent=item.name+' · '+item.id+' v'+item.version;byId('skinReviewMeta').innerHTML=(item.note?'<span>'+esc(item.note)+'</span>':'')+'<span>作者 '+esc(item.author)+'</span><span>'+kb(item.size)+'</span>'+[skin.accent].concat(skin.colors||[]).map((color)=>'<span class="dot" style="background:'+esc(color)+'" title="'+esc(color)+'"></span>').join('');byId('skinReviewDescription').textContent=item.description||'';const images=[...skin.art,...(skin.wide||[])].map((url)=>{const img=document.createElement('img');img.src=url;img.alt='';return img});if(skin.icons){const img=document.createElement('img');img.src=skin.icons;img.alt='';img.className='icons';images.push(img)}byId('skinReviewImages').replaceChildren(...images);byId('skinReviewPanel').hidden=false;byId('skinReviewPanel').scrollIntoView({block:'start'});notice('看过后再决定上架或拒绝。')}
-async function decideSkin(action){if(!skinReview)return;const label=action==='approve'?'上架':'拒绝';if(!await ask(action==='approve'?'确认上架这套皮肤？':'确认拒绝这条投稿？皮肤包会被删除。'))return;try{const result=await api('/api/workshop/skins/'+action,{method:'POST',body:JSON.stringify({sid:skinReview.sid})});byId('skinReviewPanel').hidden=true;skinReview=null;await refreshSkins();notice(action==='approve'?'已上架 '+result.published.id+' v'+result.published.version+'。':'已'+label+'。','ok')}catch(error){notice(label+'失败：'+error.message,'error')}}
-byId('skinApprove').addEventListener('click',()=>decideSkin('approve'));byId('skinReject').addEventListener('click',()=>decideSkin('reject'));byId('skinReviewClose').addEventListener('click',()=>{byId('skinReviewPanel').hidden=true});byId('skinRefresh').addEventListener('click',async()=>{await refreshSkins();notice('皮肤工坊已刷新。','ok')});
+async function refreshSkins(){if(!storedToken()){byId('skinPendingBody').innerHTML='<li class="empty">请先保存管理员令牌</li>';byId('skinListBody').innerHTML='';return}try{skinState=await api('/api/workshop/skins/pending');renderSkins()}catch(error){notice(error.message,'error')}}
+function renderSkins(){byId('skinCount').textContent=skinState.pending.length?String(skinState.pending.length):'';byId('skinPendingBody').innerHTML=skinState.pending.length?skinState.pending.map((item)=>{const current=skinState.skins.find((skin)=>skin.id===item.id);return '<li><div class="grow"><b>'+esc(item.name)+'</b> <code>'+esc(item.id)+'</code> '+(current?'<span class="badge warn">更新 '+esc(current.version)+' → '+esc(item.version)+'</span>':'<span class="badge ok">新皮肤 '+esc(item.version)+'</span>')+'<div class="meta">'+(item.note?'<span>'+esc(item.note)+'</span>':'')+'<span>'+esc(item.author)+'</span><span>投稿于 '+esc(time(item.submittedAt))+'</span><span>'+kb(item.size)+'</span>'+(item.contact?'<span>联系方式：'+esc(item.contact)+'</span>':'')+'</div>'+(item.description?'<p class="notes small">'+esc(item.description)+'</p>':'')+'</div><button class="btn small primary skin-review" data-sid="'+esc(item.sid)+'">审核</button></li>'}).join(''):'<li class="empty">暂无待审核皮肤</li>';byId('skinListBody').innerHTML=skinState.skins.length?skinState.skins.map((skin)=>'<li><img class="skin-cover" src="'+esc(skin.cover.path)+'" alt=""><div class="grow"><b>'+esc(skin.name)+'</b> <code>'+esc(skin.id)+'</code> <span class="badge">v'+esc(skin.version)+'</span><div class="meta">'+(skin.note?'<span>'+esc(skin.note)+'</span>':'')+'<span>'+esc(skin.author)+'</span><span>更新于 '+esc(time(skin.updatedAt))+'</span><span>'+kb(skin.file&&skin.file.size)+'</span></div></div><button class="btn small danger skin-remove" data-id="'+esc(skin.id)+'">下架</button></li>').join(''):'<li class="empty">暂无皮肤</li>';document.querySelectorAll('.skin-review').forEach((button)=>button.addEventListener('click',()=>openSkinReview(button.dataset.sid).catch((error)=>notice(error.message,'error'))));document.querySelectorAll('.skin-remove').forEach((button)=>button.addEventListener('click',async()=>{if(!await ask('下架皮肤','下架后皮肤工坊中不再显示 '+button.dataset.id+'，已下载的站点不受影响。','下架'))return;button.disabled=true;try{await api('/api/workshop/skins/remove',{method:'POST',body:JSON.stringify({id:button.dataset.id})});notice('已下架 '+button.dataset.id+'。','ok');await refreshSkins()}catch(error){notice(error.message,'error');button.disabled=false}}))}
+async function openSkinReview(sid){const item=skinState.pending.find((entry)=>entry.sid===sid);if(!item)return;notice('加载中…');const response=await fetch('/api/workshop/skins/pending/'+sid+'.json',{headers:{authorization:'Bearer '+storedToken()}});if(!response.ok)throw new Error('加载失败：HTTP '+response.status);const skin=await response.json();skinReview=item;byId('skinReviewTitle').textContent=item.name+' · '+item.id+' v'+item.version;byId('skinReviewMeta').innerHTML=(item.note?'<span>'+esc(item.note)+'</span>':'')+'<span>作者 '+esc(item.author)+'</span><span>'+kb(item.size)+'</span>'+[skin.accent].concat(skin.colors||[]).map((color)=>'<span class="dot" style="background:'+esc(color)+'" title="'+esc(color)+'"></span>').join('');byId('skinReviewDescription').textContent=item.description||'';const images=[...skin.art,...(skin.wide||[])].map((url)=>{const img=document.createElement('img');img.src=url;img.alt='';return img});if(skin.icons){const img=document.createElement('img');img.src=skin.icons;img.alt='';img.className='icons';images.push(img)}byId('skinReviewImages').replaceChildren(...images);byId('skinReviewPanel').hidden=false;byId('skinReviewPanel').scrollIntoView({block:'start'});notice('就绪')}
+async function decideSkin(action){if(!skinReview)return;const label=action==='approve'?'上架':'拒绝';if(!await ask(action==='approve'?'上架皮肤':'拒绝投稿',action==='approve'?'上架后会显示在皮肤工坊。':'皮肤包将被删除。',label))return;try{const result=await api('/api/workshop/skins/'+action,{method:'POST',body:JSON.stringify({sid:skinReview.sid})});byId('skinReviewPanel').hidden=true;skinReview=null;await refreshSkins();notice(action==='approve'?'已上架 '+result.published.id+' v'+result.published.version+'。':'已'+label+'。','ok')}catch(error){notice(label+'失败：'+error.message,'error')}}
+byId('skinApprove').addEventListener('click',()=>decideSkin('approve'));byId('skinReject').addEventListener('click',()=>decideSkin('reject'));byId('skinReviewClose').addEventListener('click',()=>{byId('skinReviewPanel').hidden=true});byId('skinRefresh').addEventListener('click',async()=>{await refreshSkins();notice('已刷新。','ok')});
 let feedbackCursor = '', feedbackSelected = null;
-const issueNames = { image: '图片不对', save: '保存失败', sync: '同步异常', voice: '朗读异常', startup: '打不开或卡住', other: '其他问题' };
+const issueNames = { image: '图片异常', save: '保存失败', sync: '同步异常', voice: '朗读异常', startup: '无法打开或卡住', other: '其他问题' };
 const clock = value => new Date(Number(value)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
 // 运行记录按一行一条显示，最新的在前；原始 JSON 折叠在下面。
 const eventLine = event => clock(event.at) + '  ' + [event.kind, event.errorName, event.status && 'HTTP ' + event.status, event.plugin,
@@ -2737,7 +2734,7 @@ function closeFeedback() {
 function clearFeedback() {
     closeFeedback();
     byId('feedbackStats').querySelectorAll('[data-feedback-count]').forEach(item => { item.textContent = '—'; });
-    byId('feedbackHint').textContent = '保存管理员令牌后可查看。';
+    byId('feedbackHint').textContent = '请先保存管理员令牌。';
     byId('feedbackVersions').replaceChildren();
     byId('feedbackReports').replaceChildren();
     byId('feedbackNext').hidden = true;
@@ -2750,7 +2747,7 @@ async function loadFeedbackReports(cursor = '') {
         + (item.release ? '<span class="badge">' + esc(item.release) + '</span>' : '') + '<div class="meta"><span>' + esc(time(item.at)) + '</span><code>' + esc(item.id) + '</code></div></div>'
         + '<button class="btn small" type="button" data-report="' + esc(item.id) + '">查看</button></li>').join('');
     if (cursor) byId('feedbackReports').insertAdjacentHTML('beforeend', items);
-    else byId('feedbackReports').innerHTML = items || '<li class="empty">还没有收到报告</li>';
+    else byId('feedbackReports').innerHTML = items || '<li class="empty">暂无报告</li>';
 }
 async function refreshFeedback() {
     clearFeedback();
@@ -2758,7 +2755,7 @@ async function refreshFeedback() {
     try {
         const stats = await api('/api/feedback/stats');
         byId('feedbackStats').querySelectorAll('[data-feedback-count]').forEach(item => { item.textContent = stats[item.dataset.feedbackCount]; });
-        byId('feedbackHint').textContent = '同一账户的多个站点只算一个；没开统计或没送达的不计入。今日按 UTC 计算。';
+        byId('feedbackHint').textContent = '「今日」按 UTC 计算。';
         const versions = Object.entries(stats.versions).sort((a, b) => b[1] - a[1]);
         byId('feedbackVersions').innerHTML = '<span>近 30 天版本</span>' + (versions.map(([version, count]) => '<span class="badge primary">' + esc(version || '未知') + ' · ' + count + '</span>').join('') || '<span>暂无</span>');
         await loadFeedbackReports();
@@ -2770,12 +2767,12 @@ async function openFeedback(id) {
         const errors = report.events.filter(event => /error|rejection/.test(event.kind)).length;
         feedbackSelected = report;
         byId('feedbackTitle').textContent = issueNames[report.issue] || report.issue;
-        byId('feedbackMeta').innerHTML = '<span>编号 <code>' + esc(report.id) + '</code></span><span>收到 ' + esc(time(report.receivedAt)) + '</span><span>' + esc(report.release) + (report.upstream ? ' · 官方 ' + esc(report.upstream) : '')
+        byId('feedbackMeta').innerHTML = '<span>编号 <code>' + esc(report.id) + '</code></span><span>收到于 ' + esc(time(report.receivedAt)) + '</span><span>' + esc(report.release) + (report.upstream ? ' · 官方 ' + esc(report.upstream) : '')
             + '</span><span>' + report.events.length + ' 条记录' + (errors ? '，' + errors + ' 条报错' : '') + '</span>';
-        byId('feedbackNote').textContent = report.note || '没有填写补充说明。';
+        byId('feedbackNote').textContent = report.note || '无补充说明。';
         byId('feedbackNote').classList.toggle('muted', !report.note);
         byId('feedbackEnv').textContent = '浏览器：' + report.browser + '\n插件：' + (report.plugins.map(item => item.id + ' ' + item.version + (item.status ? '（' + item.status + '）' : '')).join('、') || '无');
-        byId('feedbackEvents').textContent = report.events.slice().reverse().map(eventLine).join('\n') || '没有运行记录。';
+        byId('feedbackEvents').textContent = report.events.slice().reverse().map(eventLine).join('\n') || '暂无运行记录。';
         byId('feedbackPreview').textContent = JSON.stringify(report, null, 2);
         byId('feedbackDetail').hidden = false;
         byId('feedbackDetail').scrollIntoView({ block: 'nearest' });
@@ -2787,12 +2784,12 @@ byId('feedbackReports').onclick = event => { const button = event.target.closest
 byId('feedbackFind').onsubmit = event => {
     event.preventDefault();
     const id = byId('feedbackId').value.trim().toLowerCase();
-    if (/^[a-z0-9]{9}-[a-f0-9]{8}$/.test(id)) openFeedback(id); else notice('编号格式不对，应类似 2wpj4xcha-f9dede2e。', 'warn');
+    if (/^[a-z0-9]{9}-[a-f0-9]{8}$/.test(id)) openFeedback(id); else notice('编号格式错误，例如 2wpj4xcha-f9dede2e。', 'warn');
 };
 byId('feedbackClose').onclick = closeFeedback;
 byId('feedbackDelete').onclick = async () => {
-    if (!feedbackSelected || !await ask('删除报告 ' + feedbackSelected.id + '？删除后不能恢复。')) return;
-    try { await api('/api/feedback/reports/' + feedbackSelected.id, { method: 'DELETE' }); notice('报告已删除。', 'ok'); await refreshFeedback(); }
+    if (!feedbackSelected || !await ask('删除报告', '删除后无法恢复。', '删除')) return;
+    try { await api('/api/feedback/reports/' + feedbackSelected.id, { method: 'DELETE' }); notice('已删除。', 'ok'); await refreshFeedback(); }
     catch (error) { notice(error.message, 'error'); }
 };
 byId('feedbackDownload').onclick = () => {
@@ -2817,7 +2814,7 @@ function renderConsoleHtml() {
 <div id="notice" class="notice">就绪</div>
 <div class="tabs" role="tablist">
 <button type="button" role="tab" data-tab="overview">概览</button>
-<button type="button" role="tab" data-tab="upstream">上游版本<span id="pendingCount" class="count"></span></button>
+<button type="button" role="tab" data-tab="upstream">官方版本<span id="pendingCount" class="count"></span></button>
 <button type="button" role="tab" data-tab="tests">测试版</button>
 <button type="button" role="tab" data-tab="workshop">插件审核<span id="workshopCount" class="count"></span></button>
 <button type="button" role="tab" data-tab="skins">皮肤审核<span id="skinCount" class="count"></span></button>
@@ -2826,38 +2823,37 @@ function renderConsoleHtml() {
 </div>
 <section data-panel="overview" class="panel-grid">
 <div class="metrics">
-<div class="stat"><span>清单状态</span><b id="manifestState">—</b></div>
-<div class="stat"><span>最后更新</span><b id="updatedAt">—</b></div>
-<div class="stat"><span>上游已发布 / 挂起</span><b id="counts">—</b></div>
+<div class="stat"><span>版本列表</span><b id="manifestState">—</b></div>
+<div class="stat"><span>更新时间</span><b id="updatedAt">—</b></div>
+<div class="stat"><span>已收录 / 暂不可用</span><b id="counts">—</b></div>
 <div class="stat"><span>同步错误</span><b id="syncError">—</b></div>
 </div>
-<div id="syncProgress" class="notice">同步进度：读取中…</div>
+<div id="syncProgress" class="notice">同步进度：加载中…</div>
 <div id="syncErrorDetail" class="notice error" hidden></div>
-<div class="actions"><button id="syncNow" class="btn primary" type="button">同步上游版本</button><button id="refresh" class="btn" type="button">刷新状态</button></div>
-<p class="muted small">「同步上游版本」只拉取 RPH 上游；测试版在「测试版」一栏单独同步；插件工坊不需要同步，审核上架后立即生效。</p>
+<div class="actions"><button id="syncNow" class="btn primary" type="button">同步官方版本</button><button id="refresh" class="btn" type="button">刷新</button></div>
 </section>
 <section data-panel="upstream" class="panel-grid" hidden>
-<div><h2>已发布版本</h2><ul id="versionsBody" class="list card"></ul></div>
+<div><h2>已收录版本</h2><ul id="versionsBody" class="list card"></ul></div>
 <div id="announcementPanel" class="card pad" hidden></div>
-<div><h2>挂起的版本</h2><ul id="pendingBody" class="list card"></ul></div>
+<div><h2>暂不可用的版本</h2><ul id="pendingBody" class="list card"></ul></div>
 </section>
 <section data-panel="tests" class="panel-grid" hidden>
-<div><h2>测试版</h2><div class="actions"><button id="syncTests" class="btn" type="button">同步测试版</button></div><p class="muted small">来自 GitHub 上的日期标签 Release，每小时 07 分、37 分自动同步，也可以手动同步。</p><ul id="testsBody" class="list card"><li class="empty">读取中…</li></ul></div>
+<div><h2>测试版</h2><div class="actions"><button id="syncTests" class="btn" type="button">同步测试版</button></div><p class="muted small">每小时 07 分和 37 分自动同步。</p><ul id="testsBody" class="list card"><li class="empty">加载中…</li></ul></div>
 </section>
 <section data-panel="workshop" class="panel-grid" hidden>
-<div class="block-head" style="margin:0"><div><h2>待审核投稿</h2><p class="muted small">投稿页：<a href="/workshop/submit">/workshop/submit</a>。同一 id 上架会覆盖旧版本。</p></div><button id="workshopRefresh" class="btn" type="button">刷新</button></div>
+<div class="block-head" style="margin:0"><div><h2>待审核投稿</h2><p class="muted small">投稿页：<a href="/workshop/submit">/workshop/submit</a></p></div><button id="workshopRefresh" class="btn" type="button">刷新</button></div>
 <ul id="workshopPendingBody" class="list card"></ul>
 <div id="reviewPanel" class="card pad" hidden>
 <div class="review-head"><div><h2 id="reviewTitle"></h2><div id="reviewMeta" class="meta"></div></div><button id="reviewClose" class="btn small" type="button">关闭</button></div>
 <p id="reviewDescription" class="notes"></p>
-<div class="code-tabs"><button id="viewDiff" class="btn small" type="button">和已上架版本对比</button><button id="viewFull" class="btn small" type="button">完整代码</button></div>
+<div class="code-tabs"><button id="viewDiff" class="btn small" type="button">对比已上架版本</button><button id="viewFull" class="btn small" type="button">完整代码</button></div>
 <div id="reviewCode" class="code"></div>
 <div class="actions" style="margin-top:12px"><button id="reviewApprove" class="btn primary" type="button">上架</button><button id="reviewReject" class="btn danger" type="button">拒绝</button></div>
 </div>
 <div><h2>已上架插件</h2><ul id="workshopPluginsBody" class="list card"></ul></div>
 </section>
 <section data-panel="skins" class="panel-grid" hidden>
-<div class="block-head" style="margin:0"><div><h2>待审核皮肤</h2><p class="muted small">投稿页：<a href="/workshop/skins/submit">/workshop/skins/submit</a>。同一 id 上架会覆盖旧版本。</p></div><button id="skinRefresh" class="btn" type="button">刷新</button></div>
+<div class="block-head" style="margin:0"><div><h2>待审核皮肤</h2><p class="muted small">投稿页：<a href="/workshop/skins/submit">/workshop/skins/submit</a></p></div><button id="skinRefresh" class="btn" type="button">刷新</button></div>
 <ul id="skinPendingBody" class="list card"></ul>
 <div id="skinReviewPanel" class="card pad" hidden>
 <div class="review-head"><div><h2 id="skinReviewTitle"></h2><div id="skinReviewMeta" class="meta"></div></div><button id="skinReviewClose" class="btn small" type="button">关闭</button></div>
@@ -2868,15 +2864,15 @@ function renderConsoleHtml() {
 <div><h2>已上架皮肤</h2><ul id="skinListBody" class="list card"></ul></div>
 </section>
 <section data-panel="feedback" class="panel-grid" hidden>
-<div class="block-head" style="margin:0"><div><h2>活跃 Cloudflare 账户</h2><p id="feedbackHint" class="muted small">保存管理员令牌后可查看。</p></div><button id="feedbackRefresh" class="btn" type="button">刷新</button></div>
+<div class="block-head" style="margin:0"><div><h2>活跃 Cloudflare 帐户</h2><p id="feedbackHint" class="muted small">请先保存管理员令牌。</p></div><button id="feedbackRefresh" class="btn" type="button">刷新</button></div>
 <div id="feedbackStats" class="metrics">
 <div class="stat"><span>今日</span><b data-feedback-count="today">—</b></div>
 <div class="stat"><span>近 7 天</span><b data-feedback-count="week">—</b></div>
 <div class="stat"><span>近 30 天</span><b data-feedback-count="month">—</b></div>
-<div class="stat"><span>累计有记录</span><b data-feedback-count="total">—</b></div>
+<div class="stat"><span>累计</span><b data-feedback-count="total">—</b></div>
 </div>
 <div id="feedbackVersions" class="meta"></div>
-<div><h2>问题报告</h2><form id="feedbackFind" class="inline-form"><input id="feedbackId" class="grow" required autocomplete="off" placeholder="输入用户转来的报告编号" aria-label="报告编号"><button class="btn" type="submit">查找</button></form></div>
+<div><h2>问题报告</h2><form id="feedbackFind" class="inline-form"><input id="feedbackId" class="grow" required autocomplete="off" placeholder="报告编号" aria-label="报告编号"><button class="btn" type="submit">查找</button></form></div>
 <div id="feedbackDetail" class="card pad" hidden>
 <div class="review-head"><h2 id="feedbackTitle"></h2><button id="feedbackClose" class="btn small" type="button">关闭</button></div>
 <div id="feedbackMeta" class="meta"></div>
@@ -2890,16 +2886,14 @@ function renderConsoleHtml() {
 <button id="feedbackNext" class="btn" type="button" hidden>加载更多</button>
 </section>
 <section data-panel="settings" class="settings" hidden>
-<div class="card pad"><h2>运行配置</h2><form id="configForm" class="inline-form" style="margin-top:10px"><label for="releaseLimit">保留上游 Release 数</label><input id="releaseLimit" type="number" min="1" max="12" step="1"><label><input id="webhookEnabled" type="checkbox"> 启用 Webhook 通知</label><button class="btn primary" type="submit">保存</button></form><div class="actions" style="margin-top:12px"><button id="webhookTest" class="btn" type="button">测试 Webhook</button></div></div>
-<div class="card pad"><h2>环境</h2><div class="kv"><span>GitHub 令牌</span><span id="secretGithub"></span></div><div class="kv"><span>Webhook 地址</span><span id="secretWebhook"></span></div><div class="kv"><span>Webhook 鉴权</span><span id="secretWebhookAuth"></span></div><div class="kv"><span>管理员令牌</span><span id="secretAdmin"></span></div><div class="kv"><span>上游仓库</span><span id="upstreamRepo"></span></div><div class="kv"><span>补丁修订</span><code id="patchRevision"></code></div></div>
+<div class="card pad"><h2>同步与通知</h2><form id="configForm" class="inline-form" style="margin-top:10px"><label for="releaseLimit">保留官方版本数</label><input id="releaseLimit" type="number" min="1" max="12" step="1"><label><input id="webhookEnabled" type="checkbox"> Webhook 通知</label><button class="btn primary" type="submit">保存</button></form><div class="actions" style="margin-top:12px"><button id="webhookTest" class="btn" type="button">测试 Webhook</button></div></div>
+<div class="card pad"><h2>环境</h2><div class="kv"><span>GitHub 令牌</span><span id="secretGithub"></span></div><div class="kv"><span>Webhook 地址</span><span id="secretWebhook"></span></div><div class="kv"><span>Webhook 令牌</span><span id="secretWebhookAuth"></span></div><div class="kv"><span>管理员令牌</span><span id="secretAdmin"></span></div><div class="kv"><span>官方仓库</span><span id="upstreamRepo"></span></div><div class="kv"><span>补丁版本</span><code id="patchRevision"></code></div></div>
 </section>`;
     return renderShell({ title: '管理', active: '/admin', main, css: ADMIN_CSS + SKIN_PREVIEW_CSS + '.skin-cover{width:42px;height:56px;border-radius:6px;object-fit:cover;object-position:center 18%}', script: ADMIN_SCRIPT });
 }
 
 function publicPendingReason(reason) {
-    if (reason === 'patch-rejected') return '适配未通过，等待维护';
-    if (reason === 'release-incomplete') return '上游发布内容不完整';
-    return '暂不可用';
+    return PENDING_REASONS[reason] || '暂不可用';
 }
 
 function publicDate(value) {
@@ -2930,7 +2924,7 @@ async function publicAnnouncement(env, url) {
             ? `<h3>${escapeHtml(entry.announcement.title)}</h3><pre>${escapeHtml(entry.announcement.content)}</pre>`
             : '<p class="muted">该版本暂无公告。</p>';
     } catch {
-        body = `<p class="notice error">公告暂时无法读取，请稍后重试。</p><form method="get" action="/" class="actions" style="margin:12px 0"><input type="hidden" name="tag" value="${escapeHtml(tag)}"><button class="btn" type="submit">重试</button></form>`;
+        body = `<p class="notice error">公告加载失败，请稍后重试。</p><form method="get" action="/" class="actions" style="margin:12px 0"><input type="hidden" name="tag" value="${escapeHtml(tag)}"><button class="btn" type="submit">重试</button></form>`;
     }
     return `<section id="announcement" class="card" aria-labelledby="announcement-title"><h2 id="announcement-title">公告 · ${escapeHtml(tag)}</h2>${body}<a class="btn small" href="/">返回版本列表</a></section>`;
 }
@@ -2944,10 +2938,10 @@ function renderPublicHtml(status, announcement = '') {
 
     const versionItem = (version, index) => `<li>
         <div class="grow"><b>${escapeHtml(version.tag)}</b> ${index === 0 ? '<span class="badge primary">最新</span>' : ''}${isDerivedTag(version.tag) ? ' <span class="badge warn">预览</span>' : ''}
-        <div class="meta"><span>上游发布 ${escapeHtml(publicDate(version.date))}</span><span>收录 ${escapeHtml(formatShortTime(version.publishedAt))}</span></div></div>
+        <div class="meta"><span>发布于 ${escapeHtml(publicDate(version.date))}</span><span>收录于 ${escapeHtml(formatShortTime(version.publishedAt))}</span></div></div>
         <a class="btn small" href="/?tag=${encodeURIComponent(version.tag)}#announcement">查看公告</a>
     </li>`;
-    const versionItems = versions.length ? versions.slice(0, 3).map(versionItem).join('') : '<li class="empty">暂无可更新版本</li>';
+    const versionItems = versions.length ? versions.slice(0, 3).map(versionItem).join('') : '<li class="empty">暂无版本</li>';
     const olderVersions = versions.length > 3
         ? `<details class="more"><summary>更早的版本（${versions.length - 3}）</summary><ul class="list">${versions.slice(3).map((version, index) => versionItem(version, index + 3)).join('')}</ul></details>`
         : '';
@@ -2958,14 +2952,14 @@ function renderPublicHtml(status, announcement = '') {
         : '';
 
     const testItem = (release) => `<div class="grow"><b>${escapeHtml(release.tag)}</b>
-        <div class="meta"><span>发布 ${escapeHtml(formatShortTime(release.publishedAt))}</span>${release.zip ? `<span>部署包 ${formatKilobytes(release.zip.size)}</span>` : ''}</div>
-        <p class="notes">${escapeHtml(release.notes || '无更新说明')}</p></div>
+        <div class="meta"><span>发布于 ${escapeHtml(formatShortTime(release.publishedAt))}</span>${release.zip ? `<span>部署包 ${formatKilobytes(release.zip.size)}</span>` : ''}</div>
+        <p class="notes">${escapeHtml(release.notes || '暂无更新说明')}</p></div>
         ${release.zip ? `<a class="btn small" href="${escapeHtml(release.zip.path)}">下载部署包</a>` : ''}`;
     const tests = latestTest
         ? `<div class="card pad"><div class="block-head" style="margin:0"><div class="grow"><b style="font-size:18px">${escapeHtml(latestTest.tag)}</b> <span class="badge primary">最新</span>
-        <div class="meta"><span>发布 ${escapeHtml(formatShortTime(latestTest.publishedAt))}</span>${latestTest.zip ? `<span>部署包 ${formatKilobytes(latestTest.zip.size)}</span>` : ''}</div></div>
+        <div class="meta"><span>发布于 ${escapeHtml(formatShortTime(latestTest.publishedAt))}</span>${latestTest.zip ? `<span>部署包 ${formatKilobytes(latestTest.zip.size)}</span>` : ''}</div></div>
         ${latestTest.zip ? `<a class="btn primary" href="${escapeHtml(latestTest.zip.path)}">下载部署包</a>` : ''}</div>
-        <p class="notes">${escapeHtml(latestTest.notes || '无更新说明')}</p></div>
+        <p class="notes">${escapeHtml(latestTest.notes || '暂无更新说明')}</p></div>
         ${testReleases.length > 1 ? `<details class="more"><summary>更早的测试版（${testReleases.length - 1}）</summary><ul class="list">${testReleases.slice(1).map((release) => `<li>${testItem(release)}</li>`).join('')}</ul></details>` : ''}`
         : '<div class="card empty">暂无测试版</div>';
 
@@ -2976,7 +2970,7 @@ function renderPublicHtml(status, announcement = '') {
         <p>${escapeHtml(plugin.description)}</p>
         <div class="meta"><span>更新于 ${escapeHtml(formatShortTime(plugin.updatedAt))}</span><a href="${escapeHtml(plugin.file.path)}">查看源码</a></div>
     </article>`).join('')}</div>`
-        : '<div class="card empty">工坊里还没有插件。<a href="/workshop/submit">投稿第一个插件</a></div>';
+        : '<div class="card empty">暂无插件。<a href="/workshop/submit">投稿插件</a></div>';
     const skinCards = skins.length
         ? `<div class="skins">${skins.map((skin) => `<article class="card skin">
         <img src="${escapeHtml(skin.cover.path)}" alt="" loading="lazy">
@@ -2984,13 +2978,13 @@ function renderPublicHtml(status, announcement = '') {
         <div class="meta">${skin.note ? `<span>${escapeHtml(skin.note)}</span>` : ''}<span>${escapeHtml(skin.author)}</span><span>${formatKilobytes(skin.file.size)}</span></div>
         ${skin.description ? `<p>${escapeHtml(skin.description)}</p>` : ''}</div>
     </article>`).join('')}</div>`
-        : '<div class="card empty">皮肤工坊里还没有皮肤。<a href="/workshop/skins/submit">投稿第一套皮肤</a></div>';
+        : '<div class="card empty">暂无皮肤。<a href="/workshop/skins/submit">投稿皮肤</a></div>';
 
     const main = `<section class="hero">
 <h1>RP-Hub 分发站</h1>
-<p class="lead">为 RP-Hub 测试版站点提供上游页面更新、测试版自更新和插件工坊。站点在「云同步」和「模块管理」里直接使用，这里可以查看可用版本和插件。</p>
+<p class="lead">为 RP-Hub 测试版站点提供官方版本更新、测试版更新、插件工坊和皮肤工坊。</p>
 <div class="stats">
-<a class="stat" href="#upstream"><span>上游最新版本</span><b>${escapeHtml(versions[0]?.tag || '—')}</b></a>
+<a class="stat" href="#upstream"><span>官方最新版本</span><b>${escapeHtml(versions[0]?.tag || '—')}</b></a>
 <a class="stat" href="#test-builds"><span>测试版最新版本</span><b>${escapeHtml(latestTest?.tag || '—')}</b></a>
 <a class="stat" href="#workshop"><span>工坊插件</span><b>${plugins.length} 个</b></a>
 <a class="stat" href="#skins"><span>工坊皮肤</span><b>${skins.length} 套</b></a>
@@ -2998,21 +2992,21 @@ function renderPublicHtml(status, announcement = '') {
 </section>
 ${announcement}
 <section id="upstream" class="block" aria-labelledby="upstream-title">
-<div class="block-head"><div><h2 id="upstream-title">上游版本</h2><p class="muted small">来自 <a href="https://github.com/${escapeHtml(status.upstreamRepo)}">${escapeHtml(status.upstreamRepo)}</a>，补丁预检通过后收录。站点在「云同步 → 程序更新」选择版本。清单更新于 ${escapeHtml(formatShortTime(status.manifest.updatedAt))}（时间均为 UTC+8）。</p></div></div>
+<div class="block-head"><div><h2 id="upstream-title">官方版本</h2><p class="muted small">来自 <a href="https://github.com/${escapeHtml(status.upstreamRepo)}">${escapeHtml(status.upstreamRepo)}</a>，站点在「云同步 → 程序更新」中选择版本。列表更新于 ${escapeHtml(formatShortTime(status.manifest.updatedAt))}（时间均为 UTC+8）。</p></div></div>
 <ul class="list card">${versionItems}</ul>
 ${olderVersions}
 ${pending}
 </section>
 <section id="test-builds" class="block" aria-labelledby="test-title">
-<div class="block-head"><div><h2 id="test-title">测试版</h2><p class="muted small">来自 ${escapeHtml(status.testReleaseRepo || '')}。设置了 CF_API_TOKEN 的站点在「云同步 → 测试版更新」一键更新；其他站点下载部署包后上传到 Cloudflare Pages。第一次部署见 <a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/docs/INSTALL.md">安装与更新</a>。</p></div></div>
+<div class="block-head"><div><h2 id="test-title">测试版</h2><p class="muted small">来自 ${escapeHtml(status.testReleaseRepo || '')}。设置了 CF_API_TOKEN 的站点可在「云同步 → 测试版更新」中点击「立即更新」，其他站点下载部署包后上传到 Cloudflare Pages。首次部署见<a href="https://github.com/ShirahaTobisa/RP-Hub/blob/main/docs/INSTALL.md">安装说明</a>。</p></div></div>
 ${tests}
 </section>
 <section id="workshop" class="block" aria-labelledby="workshop-title">
-<div class="block-head"><div><h2 id="workshop-title">插件工坊</h2><p class="muted small">经审核上架，测试版站点在「模块管理 → 工坊」一键安装和更新。插件拥有页面全部权限，请只安装信任的插件。</p></div><a class="btn primary" href="/workshop/submit">投稿插件</a></div>
+<div class="block-head"><div><h2 id="workshop-title">插件工坊</h2><p class="muted small">测试版站点可在「模块管理 → 工坊」中安装和更新。插件拥有页面的全部权限，请只安装信任的插件。</p></div><a class="btn primary" href="/workshop/submit">投稿插件</a></div>
 ${pluginCards}
 </section>
 <section id="skins" class="block" aria-labelledby="skins-title">
-<div class="block-head"><div><h2 id="skins-title">皮肤工坊</h2><p class="muted small">审核后上架。皮肤包里只有图片和配色，不含代码；装了「皮肤」插件的站点在「设置 → 皮肤」里下载。</p></div><a class="btn primary" href="/workshop/skins/submit">投稿皮肤</a></div>
+<div class="block-head"><div><h2 id="skins-title">皮肤工坊</h2><p class="muted small">皮肤包只含图片和配色。安装了「皮肤」插件的站点可在「设置 → 皮肤」中下载。</p></div><a class="btn primary" href="/workshop/skins/submit">投稿皮肤</a></div>
 ${skinCards}
 </section>`;
     const css = '.skins{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}.skin{padding:0;overflow:hidden}.skin img{display:block;width:100%;aspect-ratio:3/4;object-fit:cover;object-position:center 18%;background:var(--surface-2)}.skin-body{padding:10px 12px 12px}.skin-body h3{font-size:16px}.skin-body p{margin:6px 0 0;color:var(--muted);font-size:13px}';
@@ -3062,7 +3056,7 @@ async function serveAnnouncements(env, url) {
     // _mirror/ prefix itself stays unreachable from public routes.
     const object = await env.MIRROR_BUCKET.get(ANNOUNCEMENTS_KEY);
     if (!object) {
-        return jsonResponse({ ok: false, error: '公告索引尚未生成，请先在管理端执行一次同步。' }, { status: 404 });
+        return jsonResponse({ ok: false, error: '暂无公告数据，请先同步官方版本。' }, { status: 404 });
     }
     const filterTag = url.searchParams.get('tag');
     if (filterTag === null) {
@@ -3100,7 +3094,7 @@ async function serveSnapshot(pathname, env) {
 }
 
 async function readJsonRequest(request, maxBytes = 16 * 1024) {
-    if (!request.body) throw new Error('请求体不能为空。');
+    if (!request.body) throw new Error('请求内容为空。');
     const reader = request.body.getReader();
     const chunks = [];
     let total = 0;
@@ -3110,7 +3104,7 @@ async function readJsonRequest(request, maxBytes = 16 * 1024) {
         total += value.byteLength;
         if (total > maxBytes) {
             await reader.cancel();
-            throw new Error('请求体过大。');
+            throw new Error('请求内容过大。');
         }
         chunks.push(value);
     }
@@ -3123,7 +3117,7 @@ async function readJsonRequest(request, maxBytes = 16 * 1024) {
     try {
         return JSON.parse(new TextDecoder().decode(bytes));
     } catch {
-        throw new Error('请求体不是有效 JSON。');
+        throw new Error('请求内容格式错误。');
     }
 }
 
@@ -3132,14 +3126,14 @@ async function retryPending(request, env, options) {
     const tag = typeof body?.tag === 'string' ? body.tag.trim() : '';
     const commit = typeof body?.commit === 'string' ? body.commit.trim().toLowerCase() : '';
     if (!tag || sanitizeReleaseTag(tag) !== tag || !/^[a-f0-9]{40}$/.test(commit)) {
-        return jsonResponse({ ok: false, error: 'tag 或 commit 无效。' }, { status: 400 });
+        return jsonResponse({ ok: false, error: '版本参数无效。' }, { status: 400 });
     }
     const bucket = env.MIRROR_BUCKET;
     const repo = effectiveRepo(env);
     const manifestState = await readJsonObject(bucket, MANIFEST_KEY);
     const manifest = validateStoredManifest(manifestState.value, repo);
     if (!manifest.pending.some((item) => item?.tag === tag && item?.commit === commit)) {
-        return jsonResponse({ ok: false, error: '未找到指定 pending。' }, { status: 404 });
+        return jsonResponse({ ok: false, error: '未找到该版本。' }, { status: 404 });
     }
     removePending(manifest, tag, commit);
     manifest.updatedAt = nowValue(options.now);
@@ -3148,7 +3142,7 @@ async function retryPending(request, env, options) {
         JSON.stringify(manifest, null, 2),
         manifestPutOptions(manifestState.object)
     );
-    if (!stored) return jsonResponse({ ok: false, error: 'Manifest 已被另一请求更新，请刷新后重试。' }, { status: 409 });
+    if (!stored) return jsonResponse({ ok: false, error: '版本列表已更新，请刷新后重试。' }, { status: 409 });
     const sync = await syncMirror(env, options);
     return jsonResponse({ ok: sync.ok, removed: true, sync });
 }
@@ -3158,14 +3152,14 @@ async function deleteVersion(request, env, options) {
     const tag = typeof body?.tag === 'string' ? body.tag.trim() : '';
     const commit = typeof body?.commit === 'string' ? body.commit.trim().toLowerCase() : '';
     if (!tag || sanitizeReleaseTag(tag) !== tag || !/^[a-f0-9]{40}$/.test(commit)) {
-        return jsonResponse({ ok: false, error: 'tag 或 commit 无效。' }, { status: 400 });
+        return jsonResponse({ ok: false, error: '版本参数无效。' }, { status: 400 });
     }
     const bucket = env.MIRROR_BUCKET;
     const repo = effectiveRepo(env);
     const manifestState = await readJsonObject(bucket, MANIFEST_KEY);
     const manifest = validateStoredManifest(manifestState.value, repo);
     const target = manifest.versions.find((item) => item?.tag === tag && item?.commit === commit);
-    if (!target) return jsonResponse({ ok: false, error: '未找到指定版本。' }, { status: 404 });
+    if (!target) return jsonResponse({ ok: false, error: '未找到该版本。' }, { status: 404 });
     manifest.versions = manifest.versions.filter((item) => !(item?.tag === tag && item?.commit === commit));
     manifest.updatedAt = nowValue(options.now);
     const stored = await bucket.put(
@@ -3173,7 +3167,7 @@ async function deleteVersion(request, env, options) {
         JSON.stringify(manifest, null, 2),
         manifestPutOptions(manifestState.object)
     );
-    if (!stored) return jsonResponse({ ok: false, error: 'Manifest 已被另一请求更新，请刷新后重试。' }, { status: 409 });
+    if (!stored) return jsonResponse({ ok: false, error: '版本列表已更新，请刷新后重试。' }, { status: 409 });
     // Snapshot keys are addressed by tag+commit, so after the manifest entry
     // is gone nothing references them and the R2 objects can be reclaimed.
     // If the tag is still a live upstream release, the next sync re-publishes
@@ -3208,7 +3202,7 @@ async function updateRuntimeConfig(request, env) {
         onlyIf: state.object ? { etagMatches: state.object.etag } : { etagDoesNotMatch: '*' },
         httpMetadata: { contentType: 'application/json; charset=utf-8' }
     });
-    if (!stored) return jsonResponse({ ok: false, error: '配置已被另一请求更新，请刷新后重试。' }, { status: 409 });
+    if (!stored) return jsonResponse({ ok: false, error: '设置已被修改，请刷新后重试。' }, { status: 409 });
     return jsonResponse({ ok: true, config });
 }
 

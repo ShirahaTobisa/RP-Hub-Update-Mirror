@@ -461,7 +461,7 @@ async function testDerivedArtifactPrecheckFailuresBecomePending() {
     assert.equal(patchRejectedResult.ok, true);
     assert.equal(patchRejectedBucket.json('manifest.json').versions.length, 0);
     assert.equal(patchRejectedBucket.json('manifest.json').pending[0].reason, 'patch-rejected');
-    assert.match(patchRejectedBucket.json('manifest.json').pending[0].detail, /artifact direct intake/);
+    assert.match(patchRejectedBucket.json('manifest.json').pending[0].detail, /预览版/);
 
     const incompleteBucket = new FakeR2();
     const incompleteFixture = createFixtureFetch({
@@ -524,7 +524,7 @@ async function testArtifactUnavailableFallsBackToTree() {
     const result = await syncMirror(env(bucket), { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW });
     assert.equal(result.ok, true);
     assert.equal(bucket.json('manifest.json').versions[0].tag, '0.0.0-0813');
-    assert.match(fixture.webhooks[0].payload.detail, /fallback/);
+    assert.match(fixture.webhooks[0].payload.detail, /逐个下载文件/);
     assert(fixture.calls.some((url) => url.includes(`/git/trees/${PASS_COMMIT_NEW}`)));
 }
 
@@ -675,7 +675,7 @@ async function testExpiredArtifactFallsBackToTree() {
     const result = await syncMirror(env(bucket), { fetchImpl: fixture.fetchImpl, now: () => FIXED_NOW });
     assert.equal(result.ok, true);
     assert.equal(bucket.json('manifest.json').versions[0].commit, PASS_COMMIT_NEW);
-    assert.match(fixture.webhooks[0].payload.detail, /fallback/);
+    assert.match(fixture.webhooks[0].payload.detail, /逐个下载文件/);
     assert.equal(fixture.calls.some((url) => url.endsWith('/actions/artifacts/fixture/zip')), false);
 }
 
@@ -692,7 +692,7 @@ async function testSnapshotBudgetSpreadsBuildsAcrossRounds() {
     const progressAfterFirst = bucket.json('_mirror/sync-progress.json');
     assert.equal(progressAfterFirst.state, 'done');
     assert(progressAfterFirst.step > 0);
-    assert.match(progressAfterFirst.phase, /待回填/);
+    assert.match(progressAfterFirst.phase, /未收录/);
     const firstManifest = bucket.json('manifest.json');
     assert.equal(firstManifest.versions.length, 1);
     assert.equal(firstManifest.versions[0].tag, NEW_TAG);
@@ -916,9 +916,9 @@ async function testStatusAndConsoleEscapeSecrets() {
     assert.equal(publicResponse.status, 200);
     assert.match(publicResponse.headers.get('content-security-policy'), /default-src 'none'/);
     const publicHtml = await publicResponse.text();
-    assert(publicHtml.includes('上游版本'));
-    assert(publicHtml.includes('适配未通过，等待维护'));
-    assert(publicHtml.includes('上游发布内容不完整'));
+    assert(publicHtml.includes('官方版本'));
+    assert(publicHtml.includes('暂未适配'));
+    assert(publicHtml.includes('发布内容不完整'));
     assert(publicHtml.includes('&lt;img src=x onerror=alert(1)&gt;'));
     assert(publicHtml.includes('&lt;script&gt;alert(2)&lt;/script&gt;') || !publicHtml.includes('<script>alert(2)</script>'));
     assert.equal(/<script\b/i.test(publicHtml), false);

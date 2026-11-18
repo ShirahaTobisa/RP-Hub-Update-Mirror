@@ -120,7 +120,7 @@ projects.set('my-rph', { name: 'my-rph', subdomain: 'my-rph.pages.dev', deployme
 buckets.add('old-data');
 result = await deploy(base);
 assert.deepEqual([result.status, result.body.code], [409, 'PROJECT_EXISTS']);
-assert.match(result.body.error, /现在用的存储桶是「old-data」/);
+assert.match(result.body.error, /存储桶继续使用「old-data」/);
 result = await deploy({ ...base, overwrite: true });
 assert.deepEqual([result.body.ok, result.body.bucketCreated], [true, false]);
 assert.deepEqual(calls.find((call) => call.method === 'PATCH').body.deployment_configs.production.r2_buckets, { RP_SYNC_R2: { name: 'old-data' } });
@@ -153,7 +153,7 @@ console.log('PASS a taken pages.dev name is retried with a short suffix');
 reset();
 takenNames.add('*');
 result = await deploy(base);
-assert.match(result.body.error, /^这个项目名对应的 pages\.dev 网址已经被别人用了.*（Cloudflare 原文：Subdomain is unavailable/);
+assert.match(result.body.error, /^该项目名的 pages\.dev 网址已被占用.*（Cloudflare 原文：Subdomain is unavailable/);
 reset();
 r2Enabled = false;
 assert.match((await deploy(base)).body.error, /开通.*（Cloudflare 原文：Please enable R2/);
